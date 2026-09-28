@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.7.5';
+const VERSION = '0.7.6';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -488,12 +488,22 @@ async function mkdir(path) {
     try {
         await fsInvoke('plugin:fs|mkdir', { path, options: { recursive: true } });
     } catch (error) {
-        // Android/Tauri can return EEXIST even with recursive=true when a
-        // parent/target directory already exists. If it is really a directory,
-        // treat that as success; only rethrow when the path is unusable.
+        // Android's fs plugin may return EEXIST even for a perfectly valid
+        // directory. This is especially common when several files share the
+        // same parent (for example dist/). Treat ONLY EEXIST as success; other
+        // errors still abort the import.
+        const message = String(error?.message || error || '');
+        if (/EEXIST|os error 17|File exists/i.test(message)) return;
         if (await existsDir(path)) return;
         throw error;
     }
+}
+
+async function mkdirOnce(path, createdDirs) {
+    const normalized = normalizeFsPath(path);
+    if (!normalized || createdDirs.has(normalized)) return;
+    await mkdir(normalized);
+    createdDirs.add(normalized);
 }
 
 async function remove(path) {
@@ -531,12 +541,65 @@ function safeZipRelativePath(item, entry) {
     return rel;
 }
 
+function manifestResourceList(item) {
+    const meta = item?.meta || {};
+    const out = [];
+    for (const key of ['css', 'js']) {
+        const value = meta[key];
+        const values = Array.isArray(value) ? value : [value];
+        for (const raw of values) {
+            if (typeof raw !== 'string') continue;
+            const rel = raw.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+            if (!rel || /^https?:\/\//i.test(rel) || rel.startsWith('//')) continue;
+            out.push({ type: key, path: rel });
+        }
+    }
+    return out;
+}
+
+function hasItemFile(item, relativePath) {
+    const wanted = String(relativePath || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+    return item.fileList.some(entry => String(entry?.name || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '') === wanted);
+}
+
+async function validateManifestResources(item) {
+    const missing = manifestResourceList(item).filter(resource => !hasItemFile(item, resource.path));
+    if (missing.length) {
+        throw new Error(`扩展 ${item.displayName} 的 manifest 引用了不存在的文件：${missing.map(x => `${x.type}: ${x.path}`).join(', ')}`);
+    }
+}
+
+async function fileExistsByReadDir(path) {
+    const normalized = normalizeFsPath(path);
+    const parent = dirnamePath(normalized);
+    const name = basenamePath(normalized);
+    try {
+        const children = await readFsDir(parent);
+        return children.some(child => basenamePath(child?.name || child?.path || '') === name);
+    } catch {
+        return false;
+    }
+}
+
+async function verifyManifestResourcesInstalled(item, targetRoot) {
+    const missing = [];
+    for (const resource of manifestResourceList(item)) {
+        const target = `${targetRoot}/${resource.path}`;
+        if (!(await fileExistsByReadDir(target))) missing.push(`${resource.type}: ${resource.path}`);
+    }
+    if (missing.length) {
+        throw new Error(`导入后检测到扩展资源缺失：${missing.join(', ')}`);
+    }
+}
+
 async function importItem(item, zip, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
     const existedBefore = await existsDir(targetRoot);
     if (overwrite) await remove(targetRoot);
+    const createdDirs = new Set();
     try {
-        await mkdir(targetRoot);
+        await validateManifestResources(item);
+        await mkdirOnce(targetRoot, createdDirs);
         for (const entry of item.fileList) {
             if (entry.directory) continue;
             const rel = safeZipRelativePath(item, entry);
@@ -544,10 +607,11 @@ async function importItem(item, zip, dataRoot, overwrite) {
             const target = `${targetRoot}/${rel}`;
             const parentParts = target.split('/');
             parentParts.pop();
-            await mkdir(parentParts.join('/'));
+            await mkdirOnce(parentParts.join('/'), createdDirs);
             const bytes = await zip.readEntry(entry);
             await writeFile(target, bytes);
         }
+        await verifyManifestResourcesInstalled(item, targetRoot);
     } catch (error) {
         // Never leave a half-created first-install directory behind. Otherwise
         // the next scan would incorrectly show the extension as installed.
@@ -564,9 +628,11 @@ async function importFolderItem(item, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
     const existedBefore = await existsDir(targetRoot);
     if (overwrite) await remove(targetRoot);
+    const createdDirs = new Set();
 
     try {
-        await mkdir(targetRoot);
+        await validateManifestResources(item);
+        await mkdirOnce(targetRoot, createdDirs);
 
         const sourceRoot = normalizeFsPath(item.sourceExtensionRoot || item.sourceFile || '');
     if (!sourceRoot) throw new Error(`无法确定源扩展目录: ${item.root}`);
@@ -590,11 +656,12 @@ async function importFolderItem(item, dataRoot, overwrite) {
         const target = `${targetRoot}/${rel}`;
         const parentParts = target.split('/');
         parentParts.pop();
-        await mkdir(parentParts.join('/'));
+        await mkdirOnce(parentParts.join('/'), createdDirs);
 
         const bytes = await readFsFile(entry.path);
         await writeFile(target, bytes);
         }
+        await verifyManifestResourcesInstalled(item, targetRoot);
     } catch (error) {
         if (!existedBefore && !overwrite) {
             await remove(targetRoot);
