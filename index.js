@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.6.5';
+const VERSION = '0.6.7';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -364,7 +364,7 @@ function renderItem(item, index) {
     const installedLabel = item.existing ? '已安装' : '未安装';
     const status = builtin ? 'TT 内置' : installedLabel;
     return `<label class="stei-item ${builtin ? 'stei-item-skip' : ''}">
-        <input type="checkbox" data-stei-index="${index}" ${(builtin || item.empty || item.unreadable || !item.fileList?.length) ? 'disabled' : 'checked'}>
+        <input type="checkbox" data-stei-index="${index}" ${(builtin || item.empty || item.unreadable || !item.fileList?.length) ? 'disabled' : ''} ${(!builtin && !item.existing && !item.empty && !item.unreadable && item.fileList?.length) ? 'checked' : ''}>
         <div class="stei-item-main">
           <div class="stei-item-top">
             <span class="stei-item-name">${escapeHtml(item.displayName)}</span>
@@ -447,13 +447,22 @@ async function importItem(item, zip, dataRoot, overwrite) {
     }
 }
 
+function isUnsafeRelativePath(path) {
+    const normalized = String(path || '').replace(/\\/g, '/');
+    if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:[\\/]/.test(normalized)) return true;
+    return normalized.split('/').some(part => part === '..');
+}
+
 async function importFolderItem(item, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
     if (overwrite) await remove(targetRoot);
     await mkdir(targetRoot);
     for (const entry of item.fileList) {
-        const rel = entry.name.slice(item.root.length).replace(/^\/+/, '');
-        if (!rel || isUnsafeZipPath(rel)) throw new Error(`不安全的扩展文件路径: ${entry.name}`);
+        // Folder scan entries are already relative to the selected extension root.
+        // Do NOT slice item.root here: item.root is only the extension directory name,
+        // while entry.name is e.g. "index.js" or "assets/icon.png".
+        const rel = String(entry.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+        if (!rel || isUnsafeRelativePath(rel)) throw new Error(`不安全的扩展文件路径: ${entry.name}`);
         const target = `${targetRoot}/${rel}`;
         const parentParts = target.split('/');
         parentParts.pop();
@@ -1032,6 +1041,12 @@ async function init() {
             return;
         }
         input.click();
+    });
+
+    $('#stei_collapse').on('click', () => {
+        const collapsed = $('#st_extension_importer_settings').toggleClass('stei-collapsed').hasClass('stei-collapsed');
+        $('#stei_collapse').attr('aria-expanded', String(!collapsed));
+        $('#stei_collapse_icon').text(collapsed ? '▸' : '▾');
     });
     $('#stei_rescan').on('click', () => selectedFolderPath ? handlePickFolderPath(selectedFolderPath) : (selectedFiles.length && handlePick(selectedFiles)));
     $('#stei_select_all').on('click', () => selectAll(true));

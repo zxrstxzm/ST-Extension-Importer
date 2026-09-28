@@ -35,3 +35,8 @@
 .stei-empty { padding:12px; opacity:.65; text-align:center; }
 
 .stei-file-hint { margin-top:6px; opacity:.62; font-size:.82em; }
+
+.stei-header-actions { display:flex; align-items:center; gap:7px; }
+.stei-collapse-btn { min-width:34px; padding:4px 9px; line-height:1; }
+#st_extension_importer_settings.stei-collapsed .stei-panel > *:not(.stei-header) { display:none; }
+#st_extension_importer_settings.stei-collapsed .stei-panel { padding-bottom:8px; }
