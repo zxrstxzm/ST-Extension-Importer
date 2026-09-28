@@ -574,10 +574,15 @@ async function walkFs(root, relative = '', out = []) {
     const current = relative ? joinFsPath(root, relative) : root;
     const children = await readFsDir(current);
     for (const child of children) {
-        const name = String(child?.name || basenamePath(child?.path) || '').trim();
-        if (!name || name === '.' || name === '..') continue;
+        // Android/Tauri 的 read_dir 在不同版本可能把 name 返回成完整路径或 URI。
+        // name 只允许作为一个路径段；真实 child.path 仅用于读取文件。
+        const rawName = String(child?.name || '').trim();
+        const rawPath = String(child?.path || '').trim();
+        const name = basenamePath(rawName || rawPath).trim();
+        if (!name || name === '.' || name === '..' || name.includes('\0')) continue;
+        if (name.includes('/') || name.includes('\\')) continue;
         const rel = relative ? `${relative}/${name}` : name;
-        const childPath = child?.path || joinFsPath(current, name);
+        const childPath = rawPath || joinFsPath(current, name);
         let isDir = Boolean(
             child?.isDirectory ?? child?.is_dir ?? child?.is_directory ??
             child?.directory ?? child?.children
