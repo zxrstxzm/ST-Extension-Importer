@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.6.4';
+const VERSION = '0.6.5';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -253,23 +253,51 @@ async function scanZip(file) {
         }
     }
 
-    // If the ZIP contains a normal third-party tree, only direct child folders
-    // with a valid manifest are extensions. Nothing else is a candidate.
+    // Normal third-party collection:
+    // treat ONLY direct child folders as extension candidates. A manifest.json
+    // is optional. This mirrors the folder scanner and avoids mistaking
+    // nested src/dist/scripts/server-plugins/.git directories for extensions.
     mapped = mapped.filter(e => !isIgnoredPath(e.name));
-    const manifestEntries = mapped.filter(e => /(^|\/)manifest\.json$/i.test(e.name) && !e.directory);
-    const found = [];
-    const usedRoots = new Set();
 
-    for (const manifest of manifestEntries) {
-        const parts = manifest.name.split('/').filter(Boolean);
-        if (parts.length < 2) continue;
-        const root = parts.slice(0, -1).join('/');
-        // In a third-party tree, only immediate children are extensions.
-        if (root.split('/').length !== 1 || usedRoots.has(root)) continue;
-        const meta = await readZipManifest(zip, manifest);
-        if (!isValidExtensionManifest(meta)) continue;
-        usedRoots.add(root);
+    const IGNORE_DIRS = new Set([
+        '.git', '.github', '.idea', '.vscode',
+        'node_modules', 'src', 'dist', 'scripts', 'server-plugins',
+        'build', 'coverage', 'test', 'tests',
+    ]);
+
+    function ignoredCandidate(name) {
+        const lower = String(name || '').trim().toLowerCase();
+        if (!lower || lower === '.' || lower === '..') return true;
+        if (lower.startsWith('.')) return true;
+        if (IGNORE_DIRS.has(lower)) return true;
+        if (lower.includes('backup') || lower.includes('backups')) return true;
+        if (lower.endsWith('-backup') || lower.endsWith('_backup')) return true;
+        return false;
+    }
+
+    // Collect first path component, i.e. direct children of third-party/.
+    // Directory entries are not guaranteed to exist in every ZIP, so infer
+    // directories from file paths as well.
+    const roots = new Set();
+    for (const entry of mapped) {
+        const parts = entry.name.split('/').filter(Boolean);
+        if (parts.length >= 2 && !ignoredCandidate(parts[0])) roots.add(parts[0]);
+    }
+
+    for (const root of roots) {
         const fileList = mapped.filter(e => e.name === root || e.name.startsWith(`${root}/`));
+        const manifest = fileList.find(e => !e.directory && e.name.toLowerCase() === `${root.toLowerCase()}/manifest.json`);
+
+        let meta = {};
+        if (manifest) {
+            meta = await readZipManifest(zip, manifest) || {};
+        }
+
+        const hasUsefulFile = fileList.some(e =>
+            !e.directory && /\.(?:js|mjs|cjs|html?|css|json|wasm)$/i.test(e.name)
+        );
+        if (!fileList.some(e => !e.directory) || !hasUsefulFile) continue;
+
         found.push({
             root,
             type: 'third-party',
@@ -277,7 +305,41 @@ async function scanZip(file) {
             version: String(meta.version || ''),
             meta,
             fileList,
+            hasManifest: Boolean(manifest),
+            sourceFolder: false,
         });
+    }
+
+    // A ZIP containing a single extension's files directly at its root
+    // (without third-party/<name>/) is also accepted. It is still treated as
+    // one extension, and the ZIP filename is used as the fallback directory name.
+    if (!found.length) {
+        const rootFiles = mapped.filter(e => !e.directory && e.name);
+        const manifest = rootFiles.find(e => e.name.toLowerCase() === 'manifest.json');
+        let meta = {};
+        if (manifest) meta = await readZipManifest(zip, manifest) || {};
+
+        const hasUsefulFile = rootFiles.some(e =>
+            /\.(?:js|mjs|cjs|html?|css|json|wasm)$/i.test(e.name)
+        );
+
+        if (hasUsefulFile) {
+            const fallbackName = String(file.name || 'extension.zip')
+                .replace(/\.zip$/i, '')
+                .replace(/[^A-Za-z0-9._-]+/g, '-')
+                .replace(/^-+|-+$/g, '') || 'extension';
+
+            found.push({
+                root: fallbackName,
+                type: 'third-party',
+                displayName: String(meta.display_name || meta.displayName || fallbackName),
+                version: String(meta.version || ''),
+                meta,
+                fileList: rootFiles,
+                hasManifest: Boolean(manifest),
+                sourceFolder: false,
+            });
+        }
     }
 
     if (!found.length) {
