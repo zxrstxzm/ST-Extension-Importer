@@ -1,56 +1,24 @@
 # ST Extension Importer
 
-SillyTavern 第三方扩展迁移工具，面向 TauriTavern。
+用于 TauriTavern 的 SillyTavern 第三方扩展迁移工具。
 
-## Android 推荐用法
+## v0.7.0
 
-Android 上 TT 当前没有可用的文件夹选择器，因此点击 **「多选插件文件」**：
+- Android 主流程仍使用“选择 third-party 中任意文件”作为锚点，不依赖 Folder Picker。
+- 修正本地扩展导入时的相对路径计算：直接依据文件的真实源路径计算，不再把扩展目录名当成文件路径。
+- 修正 TT 安装目录定位：从迁移器自身的 `third-party` 安装路径确定目标目录，不再把迁移器目录本身当成目标根目录。
+- 已安装检测改为依据 TT `get_extensions` 返回的实际扩展信息判断，并兼容不同返回字段。
+- 未安装扩展默认勾选；已安装扩展默认不勾选。
+- 面板支持点击标题折叠/展开。
+- ZIP 多选和 ZIP 备用导入继续保留。
 
-1. 在每个第三方扩展目录里至少选择一个文件，推荐 `manifest.json` 或 `index.js`。
-2. 可以一次选择多个文件。
-3. 工具根据所选文件自动向上寻找包含 `manifest.json` 的扩展根目录。
-4. 自动读取整个扩展目录。
-5. 扫描后勾选需要迁移的扩展，点击 **「一键导入」**。
+## Android 使用
 
-例如：
+1. 打开 `SillyTavern/public/scripts/extensions/third-party/`。
+2. 点击本扩展的“选择 ST 扩展文件（自动扫描）”。
+3. 在任意一个第三方插件里选择一个文件，推荐 `manifest.json` 或 `index.js`。
+4. 工具会根据所选文件路径自动定位 `third-party`，扫描其下所有一级插件目录。
+5. 未安装的插件默认勾选；已安装的默认不勾选。
+6. 选择需要迁移的插件后点击“一键导入”。
 
-```text
-SillyTavern/public/scripts/extensions/third-party/
-├── cocktail/
-│   ├── manifest.json  ← 选这个
-│   └── ...
-├── tavern-db/
-│   ├── manifest.json  ← 再选这个
-│   └── ...
-```
-
-不需要把整个 575 MB 的 `third-party` 压成一个 ZIP。
-
-ZIP 导入仍然保留作为备用方案。
-
-
-## Android 自动扫描
-
-移动端不需要 Folder Picker。点击“选择 ST 扩展文件（自动扫描）”，在 `public/scripts/extensions/third-party/` 内任意一个插件中选择任意文件（推荐 `manifest.json`）。扩展会根据所选文件路径自动定位 `third-party` 目录，然后递归扫描其中的全部第三方扩展。
-
-
-## v0.6.0
-- ZIP 单文件上限提高到 1000 MB。
-- 移除对不存在的 `get_runtime_paths` 命令的依赖。
-- 通过 TauriTavern 公开的 `get_extensions` 定位本扩展自身目录，并以其父目录作为第三方扩展安装目录。
-- 移动端继续支持“选择 third-party 中任意文件作为锚点”扫描整个第三方扩展目录。
-
-
-### v0.6.3
-- 单个 ZIP 文件条目上限从 10,000 提高到 100,000，适用于包含大量小文件的第三方扩展集合。
-
-
-## v0.6.4
-- 不再要求 `manifest.json` 才能识别第三方扩展。
-- 直接把 `third-party/` 的一级子文件夹视为候选扩展。
-- `src`、`dist`、`scripts`、`server-plugins`、`.git`、`node_modules`、备份目录等不会被当成独立扩展。
-- 如果扩展有 `manifest.json`，仍会读取其中的显示名和版本；没有则使用文件夹名。
-
-
-### v0.6.7
-修复从本地 `third-party` 文件夹导入时的路径计算错误。文件扫描得到的路径已经是扩展目录内的相对路径，不再重复截掉扩展名，因此不会再把正常文件误报为“不安全的扩展文件路径”。
+ZIP 仍可作为备用方案；可以一次选择多个 ZIP。

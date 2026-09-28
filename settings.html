@@ -1,36 +1,42 @@
 <div class="stei-panel">
-  <div class="stei-header">
-    <div>
+  <button id="stei_header_toggle" class="stei-header" type="button" aria-expanded="true">
+    <div class="stei-header-main">
       <div class="stei-title">SillyTavern 扩展迁移器</div>
-      <div class="stei-subtitle">移动端优先直接扫描本地 SillyTavern 的 third-party。无需文件夹选择器：在 third-party 内选择任意一个扩展文件即可自动定位并扫描全部扩展；ZIP 作为备用方案。</div>
+      <div class="stei-subtitle">从 SillyTavern 的 third-party 目录扫描扩展并导入 TauriTavern。Android 无需文件夹选择器：只要在 third-party 内选择任意一个插件文件即可自动扫描全部插件。</div>
     </div>
-    <div class="stei-version">v0.6.8</div>
-  </div>
-
-  <div class="stei-toolbar">
-    <button id="stei_pick_local" class="menu_button">📂 扫描本地 ST 扩展</button>
-    <button id="stei_pick" class="menu_button">📦 选择 ZIP</button>
-    <button id="stei_rescan" class="menu_button" style="display:none">↻ 重新扫描</button>
-<input id="stei_file_input" type="file" accept=".zip,application/zip,application/x-zip-compressed" multiple style="display:none" />
-  </div>
-  <div class="stei-file-hint">推荐：进入 SillyTavern/public/scripts/extensions/third-party/，点“扫描本地 ST 扩展”，然后选择任意一个插件里的文件（推荐 manifest.json）。工具会自动找到 third-party 并扫描全部插件。ZIP 仍可作为备用。</div>
-
-  <div id="stei_status" class="stei-status stei-muted">尚未选择扩展。</div>
-
-  <div id="stei_summary" class="stei-summary" style="display:none">
-    <span id="stei_file_name"></span>
-    <span id="stei_count"></span>
-  </div>
-
-  <div id="stei_list" class="stei-list"></div>
-
-  <div id="stei_actions" class="stei-actions" style="display:none">
-    <div class="stei-action-left">
-      <button id="stei_select_all" class="menu_button">全选</button>
-      <button id="stei_select_none" class="menu_button">全不选</button>
+    <div class="stei-header-right">
+      <span class="stei-version">v0.7.0</span>
+      <span id="stei_collapse_icon" class="stei-collapse-icon">▾</span>
     </div>
-    <button id="stei_import" class="menu_button stei-primary">一键导入</button>
-  </div>
+  </button>
 
-  <div id="stei_result" class="stei-result" style="display:none"></div>
+  <div id="stei_body" class="stei-body">
+    <div class="stei-toolbar">
+      <button id="stei_pick_local" class="menu_button">📂 选择 ST 扩展文件（自动扫描）</button>
+      <button id="stei_pick" class="menu_button">📦 选择 ZIP</button>
+      <button id="stei_rescan" class="menu_button" style="display:none">↻ 重新扫描</button>
+      <input id="stei_file_input" type="file" accept=".zip,application/zip,application/x-zip-compressed" multiple style="display:none" />
+    </div>
+
+    <div class="stei-file-hint">推荐进入 SillyTavern/public/scripts/extensions/third-party/，选择任意一个插件里的文件（推荐 manifest.json）。工具会自动找到 third-party 并扫描全部插件。ZIP 可作为备用方案。</div>
+
+    <div id="stei_status" class="stei-status stei-muted">尚未选择扩展。</div>
+
+    <div id="stei_summary" class="stei-summary" style="display:none">
+      <span id="stei_file_name"></span>
+      <span id="stei_count"></span>
+    </div>
+
+    <div id="stei_list" class="stei-list"></div>
+
+    <div id="stei_actions" class="stei-actions" style="display:none">
+      <div class="stei-action-left">
+        <button id="stei_select_all" class="menu_button">全选</button>
+        <button id="stei_select_none" class="menu_button">全不选</button>
+      </div>
+      <button id="stei_import" class="menu_button stei-primary">一键导入</button>
+    </div>
+
+    <div id="stei_result" class="stei-result" style="display:none"></div>
+  </div>
 </div>

@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.6.9';
+const VERSION = '0.7.0';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -391,31 +391,71 @@ function renderList(items) {
     $('#stei_actions').toggle(importable);
 }
 
+function normalizeFsPath(path) {
+    return String(path || '').replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '');
+}
+
+function getThirdPartyRootFromExtensionPath(path) {
+    const p = normalizeFsPath(path);
+    const lower = p.toLowerCase();
+    const marker = '/extensions/third-party/';
+    const i = lower.indexOf(marker);
+    if (i >= 0) return p.slice(0, i + marker.length - 1);
+    // Some TT builds expose a path with a literal third-party segment but a
+    // slightly different prefix. Use the nearest ancestor named third-party.
+    const parts = p.split('/').filter(Boolean);
+    const n = parts.map(x => x.toLowerCase()).lastIndexOf('third-party');
+    if (n >= 0) return '/' + parts.slice(0, n + 1).join('/');
+    return '';
+}
+
+function collectInstalledExtensionNames(list) {
+    const installed = new Set();
+    for (const item of list) {
+        for (const value of [item?.name, item?.path, item?.folder, item?.directory]) {
+            const p = normalizeFsPath(value);
+            if (!p) continue;
+            const parts = p.split('/').filter(Boolean);
+            // The extension API may return either "third-party/foo" or an
+            // absolute path ending in "/third-party/foo[/index.js]".
+            const tp = parts.map(x => x.toLowerCase()).lastIndexOf('third-party');
+            if (tp >= 0 && parts[tp + 1]) installed.add(parts[tp + 1].toLowerCase());
+            if (parts.length) {
+                const last = parts.at(-1);
+                if (last && !/\.(?:js|mjs|cjs|json|css|html?)$/i.test(last)) {
+                    installed.add(last.toLowerCase());
+                }
+            }
+        }
+    }
+    return installed;
+}
+
 async function getInstallContext() {
     const invoke = getSafeInvoke();
     const list = await invoke('get_extensions');
     if (!Array.isArray(list)) throw new Error('无法取得 TauriTavern 扩展列表');
 
     const self = list.find(item => {
-        const name = String(item?.name || '').replace(/\\/g, '/').split('/').filter(Boolean).at(-1);
-        return name === 'ST-Extension-Importer';
+        const values = [item?.name, item?.path, item?.folder].map(x => normalizeFsPath(x).toLowerCase());
+        return values.some(x => x === 'st-extension-importer' || x.endsWith('/st-extension-importer') || x.endsWith('/st-extension-importer/index.js'));
     });
-    const extensionPath = String(self?.path || '').trim();
+    const extensionPath = String(self?.path || self?.folder || '').trim();
     if (!extensionPath) {
         throw new Error('无法定位 ST Extension Importer 的安装目录，请重新加载扩展后再试');
     }
 
-    // TT 源码中 Local 是 data/default-user/extensions，Global 是 data/extensions/third-party。
-    // 跟随迁移器自身的安装作用域，避免猜 data_root。
-    const baseDir = dirnamePath(extensionPath);
-    const installedThirdParty = new Set();
-    for (const item of list) {
-        const name = String(item?.name || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-        const m = name.match(/^third-party\/([^/]+)$/i);
-        if (m) installedThirdParty.add(m[1].toLowerCase());
+    const thirdPartyRoot = getThirdPartyRootFromExtensionPath(extensionPath);
+    if (!thirdPartyRoot) {
+        throw new Error('无法确定 TT 的 third-party 安装目录。请确认迁移器本身是安装在 data/extensions/third-party/ST-Extension-Importer。');
     }
 
-    return { baseDir, installedThirdParty, extensions: list, self };
+    return {
+        baseDir: thirdPartyRoot,
+        installedThirdParty: collectInstalledExtensionNames(list),
+        extensions: list,
+        self,
+    };
 }
 
 async function getInstallBaseDir() {
@@ -468,19 +508,31 @@ async function importFolderItem(item, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
     if (overwrite) await remove(targetRoot);
     await mkdir(targetRoot);
+
+    const sourceRoot = normalizeFsPath(item.sourceExtensionRoot || item.sourceFile || '');
+    if (!sourceRoot) throw new Error(`无法确定源扩展目录: ${item.root}`);
+
     for (const entry of item.fileList) {
-        // fileList for a folder source is already relative to the extension root
-        // (e.g. manifest.json, index.js, assets/icon.png). Do not slice item.root
-        // again; doing so turns normal paths into empty/garbled paths and triggers
-        // the safety check.
-        const rel = String(entry.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
-        if (!rel || rel.split('/').some(part => !part || part === '.' || part === '..')) {
-            throw new Error(`不安全的扩展文件路径: ${entry.name}`);
+        if (entry.directory) continue;
+
+        // Never derive the relative path by slicing the display/root name.
+        // Use the actual absolute source path returned by TT's fs picker.
+        const absolute = normalizeFsPath(entry.path);
+        if (!absolute || !absolute.toLowerCase().startsWith(sourceRoot.toLowerCase() + '/')) {
+            throw new Error(`不安全的扩展文件路径: ${entry.name || entry.path || item.root}`);
         }
+
+        const rel = absolute.slice(sourceRoot.length + 1).replace(/^\/+/, '');
+        const parts = rel.split('/');
+        if (!rel || parts.some(part => !part || part === '.' || part === '..') || /^[A-Za-z]:/.test(rel)) {
+            throw new Error(`不安全的扩展文件路径: ${entry.name || rel}`);
+        }
+
         const target = `${targetRoot}/${rel}`;
         const parentParts = target.split('/');
         parentParts.pop();
         await mkdir(parentParts.join('/'));
+
         const bytes = await readFsFile(entry.path);
         await writeFile(target, bytes);
     }
@@ -632,6 +684,7 @@ async function scanFolder(selectedPath) {
                 meta: {},
                 fileList: [],
                 sourceFile: rootPath,
+                sourceExtensionRoot: extensionRoot,
                 sourceFolder: true,
                 unreadable: true,
                 scanError: error?.message || String(error),
@@ -649,6 +702,7 @@ async function scanFolder(selectedPath) {
                 meta: {},
                 fileList: [],
                 sourceFile: rootPath,
+                sourceExtensionRoot: extensionRoot,
                 sourceFolder: true,
                 empty: true,
             });
@@ -784,6 +838,7 @@ async function scanExtensionDirectory(rootPath) {
         meta,
         fileList: normalizedFiles,
         sourceFile: rootPath,
+        sourceExtensionRoot: rootPath,
         sourceFolder: true,
     };
 }
@@ -885,13 +940,7 @@ async function handlePickExtensionFiles() {
                 seen.add(key);
                 item.sourceFile = root;
                 item.sourceFolder = true;
-                try {
-                    item.existing = await existsDir(
-                        `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`
-                    );
-                } catch {
-                    item.existing = false;
-                }
+                item.existing = install.installedThirdParty.has(key);
                 all.push(item);
             }
         }
@@ -984,11 +1033,10 @@ async function handlePick(files) {
         }
 
         entries = all;
-        const dataRoot = await getInstallBaseDir();
+        const install = await getInstallContext();
         for (const item of entries) {
-            try {
-                item.existing = await existsDir(`${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`);
-            } catch { item.existing = false; }
+            const key = extensionFolderKey(item);
+            item.existing = install.installedThirdParty.has(key);
         }
 
         renderList(entries);
@@ -1063,6 +1111,13 @@ async function init() {
     const html = await renderExtensionTemplateAsync(EXTENSION_NAME, 'settings');
     const $container = $('<div></div>').attr('id', 'st_extension_importer_settings').html(html);
     $('#extensions_settings').append($container);
+
+    $('#stei_header_toggle').on('click', function () {
+        const panel = document.querySelector('.stei-panel');
+        if (!panel) return;
+        const collapsed = panel.classList.toggle('stei-collapsed');
+        $(this).attr('aria-expanded', String(!collapsed));
+    });
 
     $('#stei_pick_local').on('click', handlePickExtensionFiles);
     $('#stei_pick').on('click', () => {

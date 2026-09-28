@@ -35,3 +35,11 @@
 .stei-empty { padding:12px; opacity:.65; text-align:center; }
 
 .stei-file-hint { margin-top:6px; opacity:.62; font-size:.82em; }
+
+.stei-header { width:100%; border:0; background:transparent; color:inherit; padding:0; text-align:left; cursor:pointer; }
+.stei-header-main { min-width:0; flex:1; }
+.stei-header-right { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
+.stei-collapse-icon { font-size:1.1em; opacity:.65; transition:transform .15s ease; }
+.stei-panel.stei-collapsed .stei-collapse-icon { transform:rotate(-90deg); }
+.stei-panel.stei-collapsed .stei-body { display:none; }
+.stei-body { margin-top:0; }
