@@ -506,8 +506,39 @@ async function mkdirOnce(path, createdDirs) {
     createdDirs.add(normalized);
 }
 
-async function remove(path) {
-    try { await fsInvoke('plugin:fs|remove', { path, options: { recursive: true } }); } catch { /* absent is fine */ }
+async function remove(path, { verify = false } = {}) {
+    try {
+        await fsInvoke('plugin:fs|remove', { path, options: { recursive: true } });
+    } catch (error) {
+        // If it is already absent, that is fine. Any other failure must be
+        // surfaced when the caller needs a clean overwrite.
+        if (await existsDir(path)) throw error;
+        return;
+    }
+    if (verify) {
+        // Android can report a successful remove while the old entry is still
+        // visible for a short time. Do not start copying into a stale tree.
+        for (let i = 0; i < 8; i++) {
+            if (!(await pathExistsAny(path))) return;
+            await new Promise(resolve => setTimeout(resolve, 60));
+        }
+        if (await pathExistsAny(path)) {
+            throw new Error(`无法覆盖旧扩展目录，删除后仍存在：${path}`);
+        }
+    }
+}
+
+async function pathExistsAny(path) {
+    const normalized = normalizeFsPath(path);
+    if (!normalized) return false;
+    try {
+        const parent = dirnamePath(normalized);
+        const name = basenamePath(normalized);
+        const children = await readFsDir(parent);
+        return children.some(child => basenamePath(child?.name || child?.path || '') === name);
+    } catch {
+        return false;
+    }
 }
 
 async function existsDir(path) {
@@ -525,6 +556,23 @@ async function writeFile(path, bytes) {
             options: JSON.stringify({ append: false, create: true, truncate: true }),
         },
     });
+}
+
+function isRuntimeImportableRelativePath(path) {
+    const rel = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    const parts = rel.split('/').filter(Boolean);
+    if (!parts.length) return false;
+    // TauriTavern's mobile fs backend rejects hidden/dev-control files such as
+    // .eslintrc.json. They are not runtime assets of a SillyTavern frontend
+    // extension, so skip them instead of failing the whole extension.
+    const ignoredNames = new Set([
+        '.gitignore', '.gitattributes', '.editorconfig', '.npmrc', '.yarnrc',
+        '.prettierrc', '.prettierrc.json', '.prettierrc.js', '.prettierignore',
+        '.eslintignore', '.eslintrc', '.eslintrc.json', '.eslintrc.js', '.eslintrc.cjs',
+        '.stylelintrc', '.stylelintrc.json', '.stylelintrc.js', '.stylelintignore',
+        '.DS_Store', 'thumbs.db'
+    ]);
+    return !parts.some(part => part.startsWith('.') || ignoredNames.has(part.toLowerCase()));
 }
 
 function safeZipRelativePath(item, entry) {
@@ -549,17 +597,30 @@ function manifestResourceList(item) {
         const values = Array.isArray(value) ? value : [value];
         for (const raw of values) {
             if (typeof raw !== 'string') continue;
-            const rel = raw.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+            let rel = raw.trim().replace(/\\/g, '/').replace(/^\.\//, '');
             if (!rel || /^https?:\/\//i.test(rel) || rel.startsWith('//')) continue;
+            // SillyTavern manifests sometimes append cache-busting query strings,
+            // e.g. index.js?heartbeat=0.99... . The query is not part of the
+            // filesystem filename and must not make a valid file look missing.
+            rel = rel.split(/[?#]/, 1)[0].trim();
+            if (!rel) continue;
             out.push({ type: key, path: rel });
         }
     }
     return out;
 }
 
+function normalizeManifestFilePath(value) {
+    return String(value || '')
+        .replace(/\\/g, '/')
+        .replace(/^\.\//, '')
+        .replace(/^\/+/, '')
+        .split(/[?#]/, 1)[0];
+}
+
 function hasItemFile(item, relativePath) {
-    const wanted = String(relativePath || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
-    return item.fileList.some(entry => String(entry?.name || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '') === wanted);
+    const wanted = normalizeManifestFilePath(relativePath);
+    return item.fileList.some(entry => normalizeManifestFilePath(entry?.name || '') === wanted);
 }
 
 async function validateManifestResources(item) {
@@ -595,7 +656,7 @@ async function verifyManifestResourcesInstalled(item, targetRoot) {
 async function importItem(item, zip, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
     const existedBefore = await existsDir(targetRoot);
-    if (overwrite) await remove(targetRoot);
+    if (overwrite) await remove(targetRoot, { verify: true });
     const createdDirs = new Set();
     try {
         await validateManifestResources(item);
@@ -603,7 +664,7 @@ async function importItem(item, zip, dataRoot, overwrite) {
         for (const entry of item.fileList) {
             if (entry.directory) continue;
             const rel = safeZipRelativePath(item, entry);
-            if (!rel) continue;
+            if (!rel || !isRuntimeImportableRelativePath(rel)) continue;
             const target = `${targetRoot}/${rel}`;
             const parentParts = target.split('/');
             parentParts.pop();
@@ -627,7 +688,7 @@ async function importItem(item, zip, dataRoot, overwrite) {
 async function importFolderItem(item, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
     const existedBefore = await existsDir(targetRoot);
-    if (overwrite) await remove(targetRoot);
+    if (overwrite) await remove(targetRoot, { verify: true });
     const createdDirs = new Set();
 
     try {
@@ -648,6 +709,7 @@ async function importFolderItem(item, dataRoot, overwrite) {
         // our own directory traversal, while the actual entry.path is used only to
         // read the bytes.
         const rel = String(entry.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+        if (!isRuntimeImportableRelativePath(rel)) continue;
         const parts = rel.split('/');
         if (!rel || rel.startsWith('/') || parts.some(part => !part || part === '.' || part === '..') || /^[A-Za-z]:[\\/]/.test(rel)) {
             throw new Error(`不安全的扩展文件路径: ${entry.name || entry.path || item.root}`);
