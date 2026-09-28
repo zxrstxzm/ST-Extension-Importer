@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.7.8';
+const VERSION = '0.7.9';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -506,6 +506,68 @@ async function mkdirOnce(path, createdDirs) {
     createdDirs.add(normalized);
 }
 
+// Android/Tauri can contain a stale FILE where the new extension expects a
+// DIRECTORY (for example: tokimemo/dist is a file, while the new package
+// needs tokimemo/dist/heartbeatMemories.bundle.js). `mkdir(..., recursive)`
+// cannot repair that shape mismatch and returns ENOTDIR. Before creating every
+// parent directory, walk its components and replace any file occupying a
+// required directory slot. This makes imports genuinely overwrite-safe, even
+// when a previous broken import left a malformed tree behind.
+async function ensureDirectoryPath(path, createdDirs) {
+    const normalized = normalizeFsPath(path);
+    if (!normalized || createdDirs.has(normalized)) return;
+
+    const absolute = normalized.startsWith('/');
+    const parts = normalized.split('/').filter(Boolean);
+    let current = absolute ? '' : '';
+
+    for (const part of parts) {
+        current = current ? `${current}/${part}` : (absolute ? `/${part}` : part);
+        if (createdDirs.has(current)) continue;
+
+        const parent = dirnamePath(current);
+        const name = basenamePath(current);
+        let found = null;
+        try {
+            const children = await readFsDir(parent);
+            found = children.find(child => basenamePath(child?.name || child?.path || '') === name) || null;
+        } catch {
+            // If the parent cannot be enumerated, fall back to mkdir below.
+        }
+
+        if (found) {
+            const isDir = Boolean(
+                found?.isDirectory ?? found?.is_dir ?? found?.is_directory ??
+                found?.directory ?? found?.children
+            );
+            if (!isDir) {
+                const stalePath = String(found?.path || current);
+                await remove(stalePath, { verify: true });
+            }
+        }
+
+        await mkdir(current);
+        createdDirs.add(current);
+    }
+}
+
+async function ensureFileTargetAvailable(path) {
+    const normalized = normalizeFsPath(path);
+    if (!normalized) return;
+    const parent = dirnamePath(normalized);
+    const name = basenamePath(normalized);
+    try {
+        const children = await readFsDir(parent);
+        const found = children.find(child => basenamePath(child?.name || child?.path || '') === name);
+        if (found) {
+            await remove(String(found?.path || normalized), { verify: true });
+        }
+    } catch {
+        // The target is absent or the parent is not enumerable; write_file will
+        // report a real error if it cannot create/replace it.
+    }
+}
+
 async function remove(path, { verify = false } = {}) {
     try {
         await fsInvoke('plugin:fs|remove', { path, options: { recursive: true } });
@@ -671,7 +733,8 @@ async function importItem(item, zip, dataRoot, overwrite) {
             const target = `${targetRoot}/${rel}`;
             const parentParts = target.split('/');
             parentParts.pop();
-            await mkdirOnce(parentParts.join('/'), createdDirs);
+            await ensureDirectoryPath(parentParts.join('/'), createdDirs);
+            await ensureFileTargetAvailable(target);
             const bytes = await zip.readEntry(entry);
             await writeFile(target, bytes);
         }
@@ -721,7 +784,8 @@ async function importFolderItem(item, dataRoot, overwrite) {
         const target = `${targetRoot}/${rel}`;
         const parentParts = target.split('/');
         parentParts.pop();
-        await mkdirOnce(parentParts.join('/'), createdDirs);
+        await ensureDirectoryPath(parentParts.join('/'), createdDirs);
+        await ensureFileTargetAvailable(target);
 
         const bytes = await readFsFile(entry.path);
         await writeFile(target, bytes);
