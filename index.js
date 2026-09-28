@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.6.7';
+const VERSION = '0.6.9';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -358,13 +358,16 @@ function targetRelativeRoot(item) {
 
 function isBuiltin(item) { return item.type === 'builtin'; }
 function isImportable(item) { return item.type === 'third-party'; }
+function extensionFolderKey(item) {
+    return String(item?.root || '').replace(/\\/g, '/').split('/').filter(Boolean).at(-1)?.toLowerCase() || '';
+}
 
 function renderItem(item, index) {
     const builtin = isBuiltin(item);
     const installedLabel = item.existing ? '已安装' : '未安装';
     const status = builtin ? 'TT 内置' : installedLabel;
     return `<label class="stei-item ${builtin ? 'stei-item-skip' : ''}">
-        <input type="checkbox" data-stei-index="${index}" ${(builtin || item.empty || item.unreadable || !item.fileList?.length) ? 'disabled' : ''} ${(!builtin && !item.existing && !item.empty && !item.unreadable && item.fileList?.length) ? 'checked' : ''}>
+        <input type="checkbox" data-stei-index="${index}" ${(builtin || item.empty || item.unreadable || !item.fileList?.length) ? 'disabled' : 'checked'}>
         <div class="stei-item-main">
           <div class="stei-item-top">
             <span class="stei-item-name">${escapeHtml(item.displayName)}</span>
@@ -388,10 +391,7 @@ function renderList(items) {
     $('#stei_actions').toggle(importable);
 }
 
-async function getInstallBaseDir() {
-    // TauriTavern 的公开 invoke surface 不包含 get_runtime_paths。
-    // 直接通过当前已安装扩展的公开 get_extensions 结果取得实际扩展目录，
-    // 再取其父目录作为第三方扩展安装目录。这样不需要修改 TT 核心。
+async function getInstallContext() {
     const invoke = getSafeInvoke();
     const list = await invoke('get_extensions');
     if (!Array.isArray(list)) throw new Error('无法取得 TauriTavern 扩展列表');
@@ -404,7 +404,22 @@ async function getInstallBaseDir() {
     if (!extensionPath) {
         throw new Error('无法定位 ST Extension Importer 的安装目录，请重新加载扩展后再试');
     }
-    return dirnamePath(extensionPath);
+
+    // TT 源码中 Local 是 data/default-user/extensions，Global 是 data/extensions/third-party。
+    // 跟随迁移器自身的安装作用域，避免猜 data_root。
+    const baseDir = dirnamePath(extensionPath);
+    const installedThirdParty = new Set();
+    for (const item of list) {
+        const name = String(item?.name || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+        const m = name.match(/^third-party\/([^/]+)$/i);
+        if (m) installedThirdParty.add(m[1].toLowerCase());
+    }
+
+    return { baseDir, installedThirdParty, extensions: list, self };
+}
+
+async function getInstallBaseDir() {
+    return (await getInstallContext()).baseDir;
 }
 
 async function mkdir(path) {
@@ -416,8 +431,10 @@ async function remove(path) {
 }
 
 async function existsDir(path) {
-    try { await getRawInvoke()('plugin:fs|read_dir', { path }); return true; }
-    catch { return false; }
+    try {
+        const result = await getRawInvoke()('plugin:fs|read_dir', { path });
+        return Array.isArray(result) || Array.isArray(result?.entries) || Array.isArray(result?.children);
+    } catch { return false; }
 }
 
 async function writeFile(path, bytes) {
@@ -447,22 +464,19 @@ async function importItem(item, zip, dataRoot, overwrite) {
     }
 }
 
-function isUnsafeRelativePath(path) {
-    const normalized = String(path || '').replace(/\\/g, '/');
-    if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:[\\/]/.test(normalized)) return true;
-    return normalized.split('/').some(part => part === '..');
-}
-
 async function importFolderItem(item, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
     if (overwrite) await remove(targetRoot);
     await mkdir(targetRoot);
     for (const entry of item.fileList) {
-        // Folder scan entries are already relative to the selected extension root.
-        // Do NOT slice item.root here: item.root is only the extension directory name,
-        // while entry.name is e.g. "index.js" or "assets/icon.png".
+        // fileList for a folder source is already relative to the extension root
+        // (e.g. manifest.json, index.js, assets/icon.png). Do not slice item.root
+        // again; doing so turns normal paths into empty/garbled paths and triggers
+        // the safety check.
         const rel = String(entry.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
-        if (!rel || isUnsafeRelativePath(rel)) throw new Error(`不安全的扩展文件路径: ${entry.name}`);
+        if (!rel || rel.split('/').some(part => !part || part === '.' || part === '..')) {
+            throw new Error(`不安全的扩展文件路径: ${entry.name}`);
+        }
         const target = `${targetRoot}/${rel}`;
         const parentParts = target.split('/');
         parentParts.pop();
@@ -511,12 +525,27 @@ async function walkFs(root, relative = '', out = []) {
         const name = String(child?.name || basenamePath(child?.path) || '').trim();
         if (!name || name === '.' || name === '..') continue;
         const rel = relative ? `${relative}/${name}` : name;
-        const isDir = Boolean(child?.isDirectory ?? child?.is_dir ?? child?.children);
+        const childPath = child?.path || joinFsPath(current, name);
+        let isDir = Boolean(
+            child?.isDirectory ?? child?.is_dir ?? child?.is_directory ??
+            child?.directory ?? child?.children
+        );
+
+        // Android/TT 某些 fs 返回值不带 isDirectory。以 read_dir 成功作为第二判断，
+        // 避免把整个插件目录名（例如 st-acu-visualizer）当成一个“文件”导入。
+        if (!isDir) {
+            try {
+                const probe = await readFsDir(childPath);
+                isDir = Array.isArray(probe);
+            } catch { /* 普通文件，继续 */ }
+        }
+
         if (isDir) {
-            if (name === 'node_modules' || name === '.git') continue;
+            const lower = name.toLowerCase();
+            if (lower === 'node_modules' || lower === '.git') continue;
             await walkFs(root, rel, out);
         } else {
-            out.push({ name: rel, path: child?.path || joinFsPath(root, rel), directory: false });
+            out.push({ name: rel, path: childPath, directory: false });
         }
     }
     return out;
@@ -674,13 +703,13 @@ async function handlePickFolderPath(path) {
         setStatus('正在扫描文件夹…');
 
         const result = await scanFolder(path);
-        const dataRoot = await getInstallBaseDir();
+        const install = await getInstallContext();
         const seen = new Set();
         for (const item of result.extensions) {
-            const key = item.root.split('/').filter(Boolean).at(-1) || item.root;
+            const key = extensionFolderKey(item);
             if (seen.has(key)) continue;
             seen.add(key);
-            item.existing = await existsDir(`${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`);
+            item.existing = install.installedThirdParty.has(key);
             entries.push(item);
         }
         renderList(entries);
@@ -837,7 +866,8 @@ async function handlePickExtensionFiles() {
             );
         }
 
-        const dataRoot = await getInstallBaseDir();
+        const install = await getInstallContext();
+        const dataRoot = install.baseDir;
         const all = [];
         const seen = new Set();
         let duplicateCount = 0;
@@ -1034,6 +1064,7 @@ async function init() {
     const $container = $('<div></div>').attr('id', 'st_extension_importer_settings').html(html);
     $('#extensions_settings').append($container);
 
+    $('#stei_pick_local').on('click', handlePickExtensionFiles);
     $('#stei_pick').on('click', () => {
         const input = document.getElementById('stei_file_input');
         if (!input) {
@@ -1041,12 +1072,6 @@ async function init() {
             return;
         }
         input.click();
-    });
-
-    $('#stei_collapse').on('click', () => {
-        const collapsed = $('#st_extension_importer_settings').toggleClass('stei-collapsed').hasClass('stei-collapsed');
-        $('#stei_collapse').attr('aria-expanded', String(!collapsed));
-        $('#stei_collapse_icon').text(collapsed ? '▸' : '▾');
     });
     $('#stei_rescan').on('click', () => selectedFolderPath ? handlePickFolderPath(selectedFolderPath) : (selectedFiles.length && handlePick(selectedFiles)));
     $('#stei_select_all').on('click', () => selectAll(true));

@@ -2,17 +2,18 @@
   <div class="stei-header">
     <div>
       <div class="stei-title">SillyTavern 扩展迁移器</div>
-      <div class="stei-subtitle">移动端优先使用 ZIP 导入。直接扫描 third-party 的一级扩展目录；manifest.json 可选，不会把 .git、src、dist、scripts、server-plugins 等嵌套目录误当成独立扩展。可一次选择多个 ZIP。</div>
+      <div class="stei-subtitle">移动端优先直接扫描本地 SillyTavern 的 third-party。无需文件夹选择器：在 third-party 内选择任意一个扩展文件即可自动定位并扫描全部扩展；ZIP 作为备用方案。</div>
     </div>
-    <div class="stei-header-actions"><div class="stei-version">v0.6.7</div><button id="stei_collapse" class="menu_button stei-collapse-btn" type="button" aria-expanded="true" title="折叠/展开"><span id="stei_collapse_icon">▾</span></button></div>
+    <div class="stei-version">v0.6.8</div>
   </div>
 
   <div class="stei-toolbar">
+    <button id="stei_pick_local" class="menu_button">📂 扫描本地 ST 扩展</button>
     <button id="stei_pick" class="menu_button">📦 选择 ZIP</button>
     <button id="stei_rescan" class="menu_button" style="display:none">↻ 重新扫描</button>
 <input id="stei_file_input" type="file" accept=".zip,application/zip,application/x-zip-compressed" multiple style="display:none" />
   </div>
-  <div class="stei-file-hint">推荐把 SillyTavern/public/scripts/extensions/third-party/ 分成一个或多个 ZIP，再在这里一次选择。文件名不限，工具会自动识别扩展目录；已安装扩展默认不勾选。</div>
+  <div class="stei-file-hint">推荐：进入 SillyTavern/public/scripts/extensions/third-party/，点“扫描本地 ST 扩展”，然后选择任意一个插件里的文件（推荐 manifest.json）。工具会自动找到 third-party 并扫描全部插件。ZIP 仍可作为备用。</div>
 
   <div id="stei_status" class="stei-status stei-muted">尚未选择扩展。</div>
 
