@@ -2,6 +2,11 @@
 
 用于 TauriTavern 的 SillyTavern 第三方扩展迁移工具。
 
+## v0.7.3
+
+- 修正 ZIP 导入时相对文件路径计算：不再使用盲目字符串截断，避免合法 ZIP 被误判为“不安全的扩展文件路径”。
+- 对每个 ZIP 条目严格验证其确实位于对应扩展目录下，再写入 TT。
+
 ## v0.7.2
 
 - Android 主流程仍使用“选择 third-party 中任意文件”作为锚点，不依赖 Folder Picker。

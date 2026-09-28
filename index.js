@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.7.1';
+const VERSION = '0.7.3';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -487,14 +487,45 @@ async function writeFile(path, bytes) {
     });
 }
 
+function safeZipRelativePath(item, entry) {
+    const raw = String(entry?.name || '').replace(/\\/g, '/');
+    if (!raw) throw new Error('ZIP 条目没有文件名');
+
+    // scanZip() stores normal collection entries as:
+    //   extension-name/path/to/file
+    // and repoPackage entries as paths relative to the repository root.
+    // Never use a blind string slice here: if the prefix is not exactly what
+    // we expect, it can turn a perfectly valid path into a malformed one.
+    let rel;
+    if (item.repoPackage) {
+        rel = raw.replace(/^\/+/, '');
+    } else {
+        const root = String(item.root || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+        const prefix = root ? `${root}/` : '';
+        if (!prefix || raw === root) {
+            throw new Error(`扩展文件路径缺少扩展目录前缀: ${raw}`);
+        }
+        if (!raw.startsWith(prefix)) {
+            throw new Error(`扩展文件路径不属于 ${root}: ${raw}`);
+        }
+        rel = raw.slice(prefix.length);
+    }
+
+    rel = rel.replace(/^\/+/, '');
+    const parts = rel.split('/');
+    if (!rel || parts.some(part => !part || part === '.' || part === '..') || /^[A-Za-z]:[\\/]/.test(rel)) {
+        throw new Error(`不安全的扩展文件路径: ${entry.name}`);
+    }
+    return rel;
+}
+
 async function importItem(item, zip, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
     if (overwrite) await remove(targetRoot);
     await mkdir(targetRoot);
     for (const entry of item.fileList) {
         if (entry.directory) continue;
-        const rel = item.repoPackage ? entry.name.replace(/^\/+/, '') : entry.name.slice(item.root.length).replace(/^\/+/, '');
-        if (!rel || isUnsafeZipPath(rel)) throw new Error(`不安全的扩展文件路径: ${entry.name}`);
+        const rel = safeZipRelativePath(item, entry);
         const target = `${targetRoot}/${rel}`;
         const parentParts = target.split('/');
         parentParts.pop();
