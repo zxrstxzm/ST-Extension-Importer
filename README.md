@@ -2,7 +2,7 @@
 
 用于 TauriTavern 的 SillyTavern 第三方扩展迁移工具。
 
-## v0.7.0
+## v0.7.1
 
 - Android 主流程仍使用“选择 third-party 中任意文件”作为锚点，不依赖 Folder Picker。
 - 修正本地扩展导入时的相对路径计算：直接依据文件的真实源路径计算，不再把扩展目录名当成文件路径。

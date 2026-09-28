@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -515,17 +515,17 @@ async function importFolderItem(item, dataRoot, overwrite) {
     for (const entry of item.fileList) {
         if (entry.directory) continue;
 
-        // Never derive the relative path by slicing the display/root name.
-        // Use the actual absolute source path returned by TT's fs picker.
-        const absolute = normalizeFsPath(entry.path);
-        if (!absolute || !absolute.toLowerCase().startsWith(sourceRoot.toLowerCase() + '/')) {
-            throw new Error(`不安全的扩展文件路径: ${entry.name || entry.path || item.root}`);
-        }
-
-        const rel = absolute.slice(sourceRoot.length + 1).replace(/^\/+/, '');
+        // walkFs() already records each file name relative to sourceExtensionRoot.
+        // On Android, plugin:fs may return child.path in a different representation
+        // (for example a normalized/URI-like path), so comparing that absolute path
+        // with sourceRoot can falsely reject every file as "unsafe".
+        // Security validation therefore uses the trusted relative path produced by
+        // our own directory traversal, while the actual entry.path is used only to
+        // read the bytes.
+        const rel = String(entry.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
         const parts = rel.split('/');
-        if (!rel || parts.some(part => !part || part === '.' || part === '..') || /^[A-Za-z]:/.test(rel)) {
-            throw new Error(`不安全的扩展文件路径: ${entry.name || rel}`);
+        if (!rel || rel.startsWith('/') || parts.some(part => !part || part === '.' || part === '..') || /^[A-Za-z]:[\\/]/.test(rel)) {
+            throw new Error(`不安全的扩展文件路径: ${entry.name || entry.path || item.root}`);
         }
 
         const target = `${targetRoot}/${rel}`;
