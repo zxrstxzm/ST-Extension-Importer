@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.6.3';
+const VERSION = '0.6.4';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -301,7 +301,7 @@ function renderItem(item, index) {
     const installedLabel = item.existing ? '已安装' : '未安装';
     const status = builtin ? 'TT 内置' : installedLabel;
     return `<label class="stei-item ${builtin ? 'stei-item-skip' : ''}">
-        <input type="checkbox" data-stei-index="${index}" ${builtin ? 'disabled' : 'checked'}>
+        <input type="checkbox" data-stei-index="${index}" ${(builtin || item.empty || item.unreadable || !item.fileList?.length) ? 'disabled' : 'checked'}>
         <div class="stei-item-main">
           <div class="stei-item-top">
             <span class="stei-item-name">${escapeHtml(item.displayName)}</span>
@@ -309,7 +309,7 @@ function renderItem(item, index) {
             <span class="stei-badge">${escapeHtml(item.type)}</span>
           </div>
           <div class="stei-item-meta">${item.version ? `${escapeHtml(item.version)} · ` : ''}${escapeHtml(item.root)}</div>
-          ${builtin ? '<div class="stei-item-warning">TT 已有对应内置扩展，默认不导入。</div>' : ''}${item.repoPackage && item.hasServerPlugin ? '<div class="stei-item-warning">此仓库同时包含 Server Plugin；当前仅迁移前端扩展文件，后端插件不会被放进 third-party 目录。</div>' : ''}
+          ${builtin ? '<div class="stei-item-warning">TT 已有对应内置扩展，默认不导入。</div>' : ''}${item.sourceFolder && !item.hasManifest ? '<div class="stei-item-warning">未发现 manifest.json，但它位于 third-party 的直接子目录中，将按扩展目录迁移。</div>' : ''}${item.empty ? '<div class="stei-item-warning">目录为空，无法导入。</div>' : ''}${item.unreadable ? `<div class="stei-item-warning">无法读取：${escapeHtml(item.scanError || '未知错误')}</div>` : ''}${item.repoPackage && item.hasServerPlugin ? '<div class="stei-item-warning">此仓库同时包含 Server Plugin；当前仅迁移前端扩展文件，后端插件不会被放进 third-party 目录。</div>' : ''}
         </div>
     </label>`;
 }
@@ -475,40 +475,118 @@ function makeFolderMappedEntries(files, rootPrefix) {
 async function scanFolder(selectedPath) {
     const rootPath = String(selectedPath || '').trim();
     if (!rootPath) throw new Error('没有选择文件夹');
-    setStatus('正在读取 SillyTavern 文件夹…');
-    const files = await walkFs(rootPath);
-    if (!files.length) throw new Error('所选文件夹为空或无法读取');
+    setStatus('正在读取 SillyTavern third-party 目录…');
 
-    const names = files.map(e => e.name.replace(/\\/g, '/'));
-    let prefix = findFolderExtensionsRoot(names);
-    if (!prefix) {
-        const base = basenamePath(rootPath).toLowerCase();
-        if (base === 'third-party') prefix = '';
-        else throw new Error('没有找到 public/scripts/extensions/third-party/。你可以直接选择 third-party 文件夹，或选择整个 SillyTavern 文件夹。');
+    // We deliberately identify extensions by their DIRECT child directory under
+    // third-party, not by manifest.json. Many real SillyTavern third-party
+    // extensions do not ship a manifest.json. Nested folders such as
+    // src/dist/scripts/server-plugins therefore cannot become separate extensions.
+    const children = await readFsDir(rootPath);
+    if (!Array.isArray(children) || !children.length) {
+        throw new Error('third-party 文件夹为空或无法读取');
     }
 
-    const mapped = makeFolderMappedEntries(files, prefix);
-    const manifestEntries = mapped.filter(e => /(^|\/)manifest\.json$/i.test(e.name));
+    const IGNORE_DIRS = new Set([
+        '.git', '.github', '.idea', '.vscode',
+        'node_modules', 'src', 'dist', 'scripts', 'server-plugins',
+        'build', 'coverage', 'test', 'tests',
+    ]);
+
+    function isIgnoredExtensionDir(name) {
+        const lower = String(name || '').trim().toLowerCase();
+        if (!lower || lower === '.' || lower === '..') return true;
+        if (lower.startsWith('.')) return true;
+        if (IGNORE_DIRS.has(lower)) return true;
+        // Common backup/cache folders that can sit directly under third-party.
+        if (lower.includes('backup') || lower.includes('backups')) return true;
+        if (lower.endsWith('-backup') || lower.endsWith('_backup')) return true;
+        return false;
+    }
+
+    const directDirs = children.filter(child => {
+        const name = String(child?.name || basenamePath(child?.path) || '').trim();
+        const isDir = Boolean(child?.isDirectory ?? child?.is_dir ?? child?.children);
+        return isDir && !isIgnoredExtensionDir(name);
+    });
+
+    if (!directDirs.length) {
+        throw new Error('third-party 目录中没有找到可迁移的扩展文件夹');
+    }
+
     const found = [];
-    const usedRoots = new Set();
-    const fileMap = new Map(files.map(e => [e.name.replace(/\\/g, '/'), e]));
+    for (const dir of directDirs) {
+        const name = String(dir?.name || basenamePath(dir?.path) || '').trim();
+        const extensionRoot = dir?.path || joinFsPath(rootPath, name);
 
-    for (const manifest of manifestEntries) {
-        const parts = manifest.name.split('/');
-        if (parts.length < 2) continue;
-        const root = parts.slice(0, -1).join('/');
-        if (usedRoots.has(root)) continue;
-        usedRoots.add(root);
+        let files = [];
+        try {
+            files = await walkFs(extensionRoot);
+        } catch (error) {
+            // A directory we cannot read is still shown, but cannot be imported.
+            found.push({
+                root: name,
+                type: 'third-party',
+                displayName: name,
+                version: '',
+                meta: {},
+                fileList: [],
+                sourceFile: rootPath,
+                sourceFolder: true,
+                unreadable: true,
+                scanError: error?.message || String(error),
+            });
+            continue;
+        }
+
+        if (!files.length) {
+            // Empty extension folders are shown but disabled by import logic/UI.
+            found.push({
+                root: name,
+                type: 'third-party',
+                displayName: name,
+                version: '',
+                meta: {},
+                fileList: [],
+                sourceFile: rootPath,
+                sourceFolder: true,
+                empty: true,
+            });
+            continue;
+        }
+
+        const normalizedFiles = files.map(e => ({
+            ...e,
+            name: String(e.name || '').replace(/\\/g, '/'),
+        }));
+
+        // manifest.json is optional. If present and valid, use its metadata.
+        const manifest = normalizedFiles.find(e => e.name.toLowerCase() === 'manifest.json');
         let meta = {};
-        try { meta = JSON.parse(new TextDecoder().decode(await readFsFile(manifest.path))); }
-        catch { /* unknown metadata is okay */ }
-        const name = root.split('/').at(-1) || root;
-        const type = 'third-party';
-        const fileList = mapped.filter(e => e.name === root || e.name.startsWith(`${root}/`)).map(e => ({ ...e, path: fileMap.get(e.name.replace(/\\/g, '/'))?.path || e.path }));
-        found.push({ root, type, displayName: String(meta.display_name || meta.displayName || name), version: String(meta.version || ''), meta, fileList, sourceFile: rootPath, sourceFolder: true });
+        if (manifest) {
+            try {
+                meta = JSON.parse(new TextDecoder().decode(await readFsFile(manifest.path)));
+            } catch { /* metadata is optional; keep folder as candidate */ }
+        }
+
+        found.push({
+            root: name,
+            type: 'third-party',
+            displayName: String(meta.display_name || meta.displayName || name),
+            version: String(meta.version || ''),
+            meta,
+            fileList: normalizedFiles,
+            sourceFile: rootPath,
+            sourceFolder: true,
+            hasManifest: Boolean(manifest),
+            hasJs: normalizedFiles.some(e => /\.(?:js|mjs|cjs)$/i.test(e.name)),
+            hasHtml: normalizedFiles.some(e => /\.(?:html|htm)$/i.test(e.name)),
+            hasCss: normalizedFiles.some(e => /\.css$/i.test(e.name)),
+        });
     }
 
-    if (!found.length) throw new Error('third-party 文件夹中没有找到可识别的扩展');
+    if (!found.length) {
+        throw new Error('third-party 目录中没有找到可迁移的扩展文件夹');
+    }
     return { extensions: found };
 }
 
@@ -719,7 +797,7 @@ async function handlePickExtensionFiles() {
         entries = all;
 
         if (!entries.length) {
-            throw new Error('third-party 目录中没有找到可识别的扩展。');
+            throw new Error('third-party 目录中没有找到可迁移的扩展文件夹。');
         }
 
         renderList(entries);
