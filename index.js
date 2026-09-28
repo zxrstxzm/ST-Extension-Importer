@@ -202,6 +202,7 @@ function rootForManifestName(name) {
 
 async function scanZip(file) {
     const zip = await parseZip(await file.arrayBuffer());
+    const found = [];
     const allEntries = zip.entries.filter(e => e.name && !isIgnoredPath(e.name));
     const allNames = allEntries.map(e => e.name);
 
