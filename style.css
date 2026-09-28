@@ -43,3 +43,5 @@
 .stei-panel.stei-collapsed .stei-collapse-icon { transform:rotate(-90deg); }
 .stei-panel.stei-collapsed .stei-body { display:none; }
 .stei-body { margin-top:0; }
+
+.stei-manual-path{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}.stei-manual-path input{flex:1;min-width:220px;padding:8px}.stei-manual-path button{white-space:nowrap}

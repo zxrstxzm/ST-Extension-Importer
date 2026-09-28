@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.7.3';
+const VERSION = '0.7.4';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -286,12 +286,19 @@ async function scanZip(file) {
     }
 
     for (const root of roots) {
-        const fileList = mapped.filter(e => e.name === root || e.name.startsWith(`${root}/`));
-        const manifest = fileList.find(e => !e.directory && e.name.toLowerCase() === `${root.toLowerCase()}/manifest.json`);
+        const rawFileList = mapped.filter(e => e.name === root || e.name.startsWith(`${root}/`));
+        // Convert every entry to a path RELATIVE TO THIS EXTENSION now.
+        // Import no longer needs to reconstruct the prefix later, which avoids
+        // failures with Android/MT Manager ZIPs and explicit directory records.
+        const fileList = rawFileList.map(e => {
+            if (e.name === root) return { ...e, name: '' };
+            return { ...e, name: e.name.slice(root.length + 1) };
+        });
+        const manifest = fileList.find(e => !e.directory && e.name.toLowerCase() === 'manifest.json');
 
         let meta = {};
         if (manifest) {
-            meta = await readZipManifest(zip, manifest) || {};
+            meta = await readZipManifest(zip, rawFileList.find(e => e === manifest) || manifest) || {};
         }
 
         const hasUsefulFile = fileList.some(e =>
@@ -351,7 +358,12 @@ async function scanZip(file) {
 
 function targetRelativeRoot(item) {
     const name = item.root.split('/').filter(Boolean).at(-1);
-    if (!name || !/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`扩展目录名不安全: ${name}`);
+    // Extension directory names are allowed to contain Unicode (for example
+    // Chinese extension names). Only reject path separators, traversal, NUL
+    // and control characters.
+    if (!name || name === '.' || name === '..' || /[\\/\0\x00-\x1F\x7F]/u.test(name)) {
+        throw new Error(`扩展目录名不安全: ${name}`);
+    }
     if (item.type !== 'third-party') throw new Error(`暂不导入非第三方扩展：${name}`);
     return name;
 }
@@ -488,33 +500,15 @@ async function writeFile(path, bytes) {
 }
 
 function safeZipRelativePath(item, entry) {
-    const raw = String(entry?.name || '').replace(/\\/g, '/');
-    if (!raw) throw new Error('ZIP 条目没有文件名');
-
-    // scanZip() stores normal collection entries as:
-    //   extension-name/path/to/file
-    // and repoPackage entries as paths relative to the repository root.
-    // Never use a blind string slice here: if the prefix is not exactly what
-    // we expect, it can turn a perfectly valid path into a malformed one.
-    let rel;
-    if (item.repoPackage) {
-        rel = raw.replace(/^\/+/, '');
-    } else {
-        const root = String(item.root || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-        const prefix = root ? `${root}/` : '';
-        if (!prefix || raw === root) {
-            throw new Error(`扩展文件路径缺少扩展目录前缀: ${raw}`);
-        }
-        if (!raw.startsWith(prefix)) {
-            throw new Error(`扩展文件路径不属于 ${root}: ${raw}`);
-        }
-        rel = raw.slice(prefix.length);
-    }
-
-    rel = rel.replace(/^\/+/, '');
+    const rel = String(entry?.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!rel) return null; // explicit directory entry
     const parts = rel.split('/');
-    if (!rel || parts.some(part => !part || part === '.' || part === '..') || /^[A-Za-z]:[\\/]/.test(rel)) {
-        throw new Error(`不安全的扩展文件路径: ${entry.name}`);
+    if (
+        parts.some(part => !part || part === '.' || part === '..') ||
+        /^[A-Za-z]:[\\/]/.test(rel) ||
+        rel.startsWith('/')
+    ) {
+        throw new Error(`不安全的扩展文件路径: ${entry?.name || ''}`);
     }
     return rel;
 }
@@ -526,6 +520,7 @@ async function importItem(item, zip, dataRoot, overwrite) {
     for (const entry of item.fileList) {
         if (entry.directory) continue;
         const rel = safeZipRelativePath(item, entry);
+        if (!rel) continue;
         const target = `${targetRoot}/${rel}`;
         const parentParts = target.split('/');
         parentParts.pop();
@@ -879,6 +874,23 @@ async function scanExtensionDirectory(rootPath) {
     };
 }
 
+function normalizePickerPath(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    if (/^file:\/\//i.test(raw)) {
+        try {
+            const url = new URL(raw);
+            return decodeURIComponent(url.pathname);
+        } catch {
+            return raw.replace(/^file:\/\//i, '');
+        }
+    }
+    if (/^content:\/\//i.test(raw) || /^ms-appx:\/\//i.test(raw)) {
+        return '';
+    }
+    return raw;
+}
+
 function inferThirdPartyRootFromPath(anchorPath) {
     const normalized = String(anchorPath || '').replace(/\\/g, '/');
     const lower = normalized.toLowerCase();
@@ -928,11 +940,18 @@ async function handlePickExtensionFiles() {
             },
         });
 
-        const paths = (Array.isArray(picked) ? picked : [picked])
+        const rawPaths = (Array.isArray(picked) ? picked : [picked])
             .filter(Boolean)
             .map(String);
+        const paths = rawPaths.map(normalizePickerPath).filter(Boolean);
 
-        if (!paths.length) return;
+        if (!paths.length) {
+            const sample = rawPaths[0] || '';
+            if (/^content:\/\//i.test(sample)) {
+                throw new Error('Android 文件选择器返回的是 content:// URI，不是可供 plugin:fs 使用的本地路径。请改用 ZIP 导入，或在下方手动输入 SillyTavern/third-party 的真实路径。');
+            }
+            throw new Error('文件选择器没有返回可用的本地路径。请改用 ZIP 导入，或手动输入 third-party 路径。');
+        }
 
         entries = [];
         selectedFiles = [];
@@ -999,6 +1018,21 @@ async function handlePickExtensionFiles() {
         );
     } catch (error) {
         entries = [];
+        setStatus(`扫描失败：${error?.message || error}`);
+        window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
+    }
+}
+
+async function handleScanManualPath() {
+    try {
+        const input = document.getElementById('stei_manual_path');
+        const path = String(input?.value || '').trim();
+        if (!path) throw new Error('请先输入 third-party 路径。');
+        if (/^content:\/\//i.test(path) || /^https?:\/\//i.test(path)) {
+            throw new Error('这里需要真实本地路径，例如 /storage/XXXX/public/scripts/extensions/third-party，而不是 content:// 或 http(s) URL。');
+        }
+        await handlePickFolderPath(path);
+    } catch (error) {
         setStatus(`扫描失败：${error?.message || error}`);
         window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
     }
@@ -1156,6 +1190,7 @@ async function init() {
     });
 
     $('#stei_pick_local').on('click', handlePickExtensionFiles);
+    $('#stei_manual_scan').on('click', handleScanManualPath);
     $('#stei_pick').on('click', () => {
         const input = document.getElementById('stei_file_input');
         if (!input) {

@@ -2,10 +2,10 @@
   <button id="stei_header_toggle" class="stei-header" type="button" aria-expanded="true">
     <div class="stei-header-main">
       <div class="stei-title">SillyTavern 扩展迁移器</div>
-      <div class="stei-subtitle">从 SillyTavern 的 third-party 目录扫描扩展并导入 TauriTavern。Android 无需文件夹选择器：只要在 third-party 内选择任意一个插件文件即可自动扫描全部插件。</div>
+      <div class="stei-subtitle">从 SillyTavern 的 third-party 目录扫描扩展并导入 TauriTavern。Android 优先使用 ZIP；也可尝试选择文件或手动输入 third-party 本地路径。</div>
     </div>
     <div class="stei-header-right">
-      <span class="stei-version">v0.7.1</span>
+      <span class="stei-version">v0.7.4</span>
       <span id="stei_collapse_icon" class="stei-collapse-icon">▾</span>
     </div>
   </button>
@@ -18,7 +18,12 @@
       <input id="stei_file_input" type="file" accept=".zip,application/zip,application/x-zip-compressed" multiple style="display:none" />
     </div>
 
-    <div class="stei-file-hint">推荐进入 SillyTavern/public/scripts/extensions/third-party/，选择任意一个插件里的文件（推荐 manifest.json）。工具会自动找到 third-party 并扫描全部插件。ZIP 可作为备用方案。</div>
+    <div class="stei-manual-path">
+      <input id="stei_manual_path" type="text" placeholder="可选：/storage/XXXX/public/scripts/extensions/third-party" />
+      <button id="stei_manual_scan" class="menu_button">扫描此路径</button>
+    </div>
+
+    <div class="stei-file-hint">推荐使用 ZIP 导入。Android 文件选择器如果返回 content:// URI，不能直接作为 plugin:fs 路径；此时可手动填写真实 third-party 路径。</div>
 
     <div id="stei_status" class="stei-status stei-muted">尚未选择扩展。</div>
 
