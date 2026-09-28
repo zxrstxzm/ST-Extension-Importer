@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.7.4';
+const VERSION = '0.7.5';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -155,7 +155,7 @@ function isValidExtensionManifest(meta) {
 
 function isIgnoredPath(path) {
     const parts = String(path || '').split('/').filter(Boolean).map(x => x.toLowerCase());
-    return parts.includes('.git') || parts.includes('node_modules');
+    return parts.includes('.git') || parts.includes('.github') || parts.includes('.gitignore') || parts.includes('.gitattributes') || parts.includes('.gitmodules') || parts.includes('.gitkeep') || parts.includes('node_modules');
 }
 
 function findExplicitThirdPartyRoot(names) {
@@ -421,23 +421,33 @@ function getThirdPartyRootFromExtensionPath(path) {
     return '';
 }
 
-function collectInstalledExtensionNames(list) {
+async function collectInstalledExtensionNames(list, thirdPartyRoot) {
     const installed = new Set();
+
+    // The filesystem is the source of truth. get_extensions() may still contain
+    // a stale/in-memory entry after a failed first install, which used to make
+    // a failed import appear as "已安装" on the next scan.
+    try {
+        const children = await readFsDir(thirdPartyRoot);
+        for (const child of children) {
+            const name = basenamePath(child?.name || child?.path || '').trim();
+            const isDir = Boolean(child?.isDirectory ?? child?.is_dir ?? child?.is_directory ?? child?.directory ?? child?.children);
+            if (isDir && name && name !== '.' && name !== '..' && !name.startsWith('.')) {
+                installed.add(name.toLowerCase());
+            }
+        }
+        return installed;
+    } catch {
+        // Fallback for TT builds where read_dir is temporarily unavailable.
+    }
+
     for (const item of list) {
         for (const value of [item?.name, item?.path, item?.folder, item?.directory]) {
             const p = normalizeFsPath(value);
             if (!p) continue;
             const parts = p.split('/').filter(Boolean);
-            // The extension API may return either "third-party/foo" or an
-            // absolute path ending in "/third-party/foo[/index.js]".
             const tp = parts.map(x => x.toLowerCase()).lastIndexOf('third-party');
             if (tp >= 0 && parts[tp + 1]) installed.add(parts[tp + 1].toLowerCase());
-            if (parts.length) {
-                const last = parts.at(-1);
-                if (last && !/\.(?:js|mjs|cjs|json|css|html?)$/i.test(last)) {
-                    installed.add(last.toLowerCase());
-                }
-            }
         }
     }
     return installed;
@@ -464,7 +474,7 @@ async function getInstallContext() {
 
     return {
         baseDir: thirdPartyRoot,
-        installedThirdParty: collectInstalledExtensionNames(list),
+        installedThirdParty: await collectInstalledExtensionNames(list, thirdPartyRoot),
         extensions: list,
         self,
     };
@@ -475,7 +485,15 @@ async function getInstallBaseDir() {
 }
 
 async function mkdir(path) {
-    await fsInvoke('plugin:fs|mkdir', { path, options: { recursive: true } });
+    try {
+        await fsInvoke('plugin:fs|mkdir', { path, options: { recursive: true } });
+    } catch (error) {
+        // Android/Tauri can return EEXIST even with recursive=true when a
+        // parent/target directory already exists. If it is really a directory,
+        // treat that as success; only rethrow when the path is unusable.
+        if (await existsDir(path)) return;
+        throw error;
+    }
 }
 
 async function remove(path) {
@@ -515,27 +533,42 @@ function safeZipRelativePath(item, entry) {
 
 async function importItem(item, zip, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
+    const existedBefore = await existsDir(targetRoot);
     if (overwrite) await remove(targetRoot);
-    await mkdir(targetRoot);
-    for (const entry of item.fileList) {
-        if (entry.directory) continue;
-        const rel = safeZipRelativePath(item, entry);
-        if (!rel) continue;
-        const target = `${targetRoot}/${rel}`;
-        const parentParts = target.split('/');
-        parentParts.pop();
-        await mkdir(parentParts.join('/'));
-        const bytes = await zip.readEntry(entry);
-        await writeFile(target, bytes);
+    try {
+        await mkdir(targetRoot);
+        for (const entry of item.fileList) {
+            if (entry.directory) continue;
+            const rel = safeZipRelativePath(item, entry);
+            if (!rel) continue;
+            const target = `${targetRoot}/${rel}`;
+            const parentParts = target.split('/');
+            parentParts.pop();
+            await mkdir(parentParts.join('/'));
+            const bytes = await zip.readEntry(entry);
+            await writeFile(target, bytes);
+        }
+    } catch (error) {
+        // Never leave a half-created first-install directory behind. Otherwise
+        // the next scan would incorrectly show the extension as installed.
+        // For overwrite mode we preserve the current behavior rather than
+        // deleting a previously valid installation after a failed replacement.
+        if (!existedBefore && !overwrite) {
+            await remove(targetRoot);
+        }
+        throw error;
     }
 }
 
 async function importFolderItem(item, dataRoot, overwrite) {
     const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
+    const existedBefore = await existsDir(targetRoot);
     if (overwrite) await remove(targetRoot);
-    await mkdir(targetRoot);
 
-    const sourceRoot = normalizeFsPath(item.sourceExtensionRoot || item.sourceFile || '');
+    try {
+        await mkdir(targetRoot);
+
+        const sourceRoot = normalizeFsPath(item.sourceExtensionRoot || item.sourceFile || '');
     if (!sourceRoot) throw new Error(`无法确定源扩展目录: ${item.root}`);
 
     for (const entry of item.fileList) {
@@ -561,6 +594,12 @@ async function importFolderItem(item, dataRoot, overwrite) {
 
         const bytes = await readFsFile(entry.path);
         await writeFile(target, bytes);
+        }
+    } catch (error) {
+        if (!existedBefore && !overwrite) {
+            await remove(targetRoot);
+        }
+        throw error;
     }
 }
 
@@ -1154,6 +1193,9 @@ async function importSelected() {
             try {
                 if (item.sourceFolder) await importFolderItem(item, dataRoot, overwrite);
                 else await importItem(item, item.zip, dataRoot, overwrite);
+                const installedNow = await existsDir(`${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`);
+                if (!installedNow) throw new Error('导入完成但未检测到目标扩展目录');
+                item.existing = true;
                 results.push({ item, ok: true });
             } catch (error) {
                 results.push({ item, ok: false, error: error?.message || String(error) });
