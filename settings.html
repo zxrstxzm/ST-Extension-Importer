@@ -1,0 +1,35 @@
+<div class="stei-panel">
+  <div class="stei-header">
+    <div>
+      <div class="stei-title">SillyTavern 扩展迁移器</div>
+      <div class="stei-subtitle">直接选择 SillyTavern 文件夹扫描第三方扩展；ZIP 作为备用导入方式。</div>
+    </div>
+    <div class="stei-version">v0.4.0</div>
+  </div>
+
+  <div class="stei-toolbar">
+    <input type="file" id="stei_file_input" accept=".zip,application/zip" multiple hidden>
+    <button id="stei_pick_folder" class="menu_button stei-primary">📁 选择 ST 文件夹</button>
+    <button id="stei_pick" class="menu_button">📦 选择 ZIP</button>
+    <button id="stei_rescan" class="menu_button" style="display:none">↻ 重新扫描</button>
+  </div>
+
+  <div id="stei_status" class="stei-status stei-muted">尚未选择 ZIP。</div>
+
+  <div id="stei_summary" class="stei-summary" style="display:none">
+    <span id="stei_file_name"></span>
+    <span id="stei_count"></span>
+  </div>
+
+  <div id="stei_list" class="stei-list"></div>
+
+  <div id="stei_actions" class="stei-actions" style="display:none">
+    <div class="stei-action-left">
+      <button id="stei_select_all" class="menu_button">全选</button>
+      <button id="stei_select_none" class="menu_button">全不选</button>
+    </div>
+    <button id="stei_import" class="menu_button stei-primary">开始导入</button>
+  </div>
+
+  <div id="stei_result" class="stei-result" style="display:none"></div>
+</div>
