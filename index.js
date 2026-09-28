@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.7.6';
+const VERSION = '0.7.8';
 const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
@@ -510,9 +510,12 @@ async function remove(path, { verify = false } = {}) {
     try {
         await fsInvoke('plugin:fs|remove', { path, options: { recursive: true } });
     } catch (error) {
-        // If it is already absent, that is fine. Any other failure must be
-        // surfaced when the caller needs a clean overwrite.
-        if (await existsDir(path)) throw error;
+        // If it is already absent, that is fine. IMPORTANT: existsDir() only
+        // detects directories. A stale FILE at the same path would otherwise
+        // be mistaken for "absent", and the next mkdir/write would fail with
+        // Android's "Not a directory (os error 20)". Check for either a file
+        // or a directory before deciding the path is really gone.
+        if (await pathExistsAny(path)) throw error;
         return;
     }
     if (verify) {
@@ -674,12 +677,12 @@ async function importItem(item, zip, dataRoot, overwrite) {
         }
         await verifyManifestResourcesInstalled(item, targetRoot);
     } catch (error) {
-        // Never leave a half-created first-install directory behind. Otherwise
-        // the next scan would incorrectly show the extension as installed.
-        // For overwrite mode we preserve the current behavior rather than
-        // deleting a previously valid installation after a failed replacement.
-        if (!existedBefore && !overwrite) {
-            await remove(targetRoot);
+        // Never leave a half-created tree behind. In automatic-overwrite mode
+        // the old tree has already been removed, so a failed replacement must
+        // also be cleaned; otherwise the next retry can hit stale files/dirs and
+        // produce ENOTDIR again.
+        if (overwrite || !existedBefore) {
+            try { await remove(targetRoot, { verify: true }); } catch {}
         }
         throw error;
     }
@@ -725,8 +728,8 @@ async function importFolderItem(item, dataRoot, overwrite) {
         }
         await verifyManifestResourcesInstalled(item, targetRoot);
     } catch (error) {
-        if (!existedBefore && !overwrite) {
-            await remove(targetRoot);
+        if (overwrite || !existedBefore) {
+            try { await remove(targetRoot, { verify: true }); } catch {}
         }
         throw error;
     }
@@ -1307,13 +1310,12 @@ async function importSelected() {
 
     try {
         const dataRoot = await getInstallBaseDir();
-        const existing = selected.filter(item => item.existing);
-        let overwrite = false;
-        if (existing.length) {
-            const names = existing.map(x => x.displayName).join(', ');
-            overwrite = window.confirm(`以下扩展已经存在：\n${names}\n\n确定覆盖整个扩展目录吗？`);
-            if (!overwrite) return setStatus('已取消覆盖。');
-        }
+        // 导入迁移器的目标就是把 ST 当前版本完整同步到 TT。
+        // 因此不再逐次询问“是否覆盖”，而是对本次勾选的扩展始终执行
+        // 整目录覆盖：先删除目标扩展目录（无论它当前是目录还是残留文件），
+        // 再从源重新完整复制。这样可以避免旧文件与新文件混杂，也绕开
+        // Android 上最常见的 EEXIST / ENOTDIR 冲突。
+        const overwrite = true;
 
         const results = [];
         for (let i = 0; i < selected.length; i++) {
