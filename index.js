@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.8.7';
+const VERSION = '0.9.1';
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024 * 1024;
@@ -2176,6 +2176,185 @@ async function importSelected() {
     } finally {
         $('#stei_import').prop('disabled', false).removeClass('stei-busy');
     }
+}
+
+
+function dataPackageDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function exportStorageValue(value, seen = new WeakSet()) {
+    if (value === undefined) return { __stei_type: 'undefined' };
+    if (typeof value === 'bigint') return { __stei_type: 'bigint', value: String(value) };
+    if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (typeof value === 'function' || typeof value === 'symbol') return { __stei_type: 'unsupported', value: String(value) };
+    if (value instanceof Date) return { __stei_type: 'date', value: value.toISOString() };
+    if (value instanceof Blob) return { __stei_type: 'blob', mime: value.type || '', value: Array.from(new Uint8Array(await value.arrayBuffer())) };
+    if (value instanceof ArrayBuffer) return { __stei_type: 'arraybuffer', value: Array.from(new Uint8Array(value)) };
+    if (ArrayBuffer.isView(value)) return { __stei_type: 'typedarray', ctor: value.constructor?.name || 'Uint8Array', value: Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) };
+    if (value instanceof Map) {
+        if (seen.has(value)) return { __stei_type: 'circular' };
+        seen.add(value); const out = [];
+        for (const [k, v] of value) out.push([await exportStorageValue(k, seen), await exportStorageValue(v, seen)]);
+        return { __stei_type: 'map', value: out };
+    }
+    if (value instanceof Set) {
+        if (seen.has(value)) return { __stei_type: 'circular' };
+        seen.add(value); const out = [];
+        for (const v of value) out.push(await exportStorageValue(v, seen));
+        return { __stei_type: 'set', value: out };
+    }
+    if (typeof value === 'object') {
+        if (seen.has(value)) return { __stei_type: 'circular' };
+        seen.add(value);
+        if (Array.isArray(value)) return Promise.all(value.map(v => exportStorageValue(v, seen)));
+        const out = {};
+        for (const [k, v] of Object.entries(value)) out[k] = await exportStorageValue(v, seen);
+        return out;
+    }
+    return null;
+}
+
+async function importStorageValue(value) {
+    if (!value || typeof value !== 'object' || !value.__stei_type) {
+        if (Array.isArray(value)) return Promise.all(value.map(importStorageValue));
+        if (value && typeof value === 'object') { const out = {}; for (const [k,v] of Object.entries(value)) out[k] = await importStorageValue(v); return out; }
+        return value;
+    }
+    switch (value.__stei_type) {
+        case 'undefined': return undefined;
+        case 'bigint': return BigInt(value.value);
+        case 'date': return new Date(value.value);
+        case 'blob': return new Blob([new Uint8Array(value.value || [])], { type: value.mime || '' });
+        case 'arraybuffer': return new Uint8Array(value.value || []).buffer;
+        case 'typedarray': { const bytes = new Uint8Array(value.value || []); const C = globalThis[value.ctor] || Uint8Array; return C === DataView ? new DataView(bytes.buffer) : new C(bytes.buffer); }
+        case 'map': { const m = new Map(); for (const [k,v] of value.value || []) m.set(await importStorageValue(k), await importStorageValue(v)); return m; }
+        case 'set': { const st = new Set(); for (const v of value.value || []) st.add(await importStorageValue(v)); return st; }
+        default: return undefined;
+    }
+}
+
+function openIndexedDB(name, version) {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(name, version);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error || new Error(`打开 IndexedDB 失败：${name}`));
+    });
+}
+
+async function exportOneIndexedDB(name) {
+    const db = await openIndexedDB(name);
+    const stores = [];
+    for (const storeName of Array.from(db.objectStoreNames)) {
+        const tx = db.transaction(storeName, 'readonly');
+        const store = tx.objectStore(storeName);
+        const meta = {
+            name: storeName,
+            keyPath: store.keyPath,
+            autoIncrement: store.autoIncrement,
+            indexes: Array.from(store.indexNames).map(indexName => {
+                const idx = store.index(indexName);
+                return { name: indexName, keyPath: idx.keyPath, unique: idx.unique, multiEntry: idx.multiEntry };
+            }),
+            records: []
+        };
+        const records = await new Promise((resolve, reject) => {
+            const req = store.openCursor(); const out = [];
+            req.onsuccess = async e => {
+                const cursor = e.target.result;
+                if (!cursor) return resolve(out);
+                out.push([await exportStorageValue(cursor.key), await exportStorageValue(cursor.value)]);
+                cursor.continue();
+            };
+            req.onerror = () => reject(req.error);
+        });
+        meta.records = records;
+        stores.push(meta);
+    }
+    const version = db.version;
+    db.close();
+    return { name, version, stores };
+}
+
+async function exportBrowserStoragePackage() {
+    const localStorageData = {};
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i); if (key == null) continue;
+        localStorageData[key] = localStorage.getItem(key);
+    }
+    const dbs = typeof indexedDB.databases === 'function' ? await indexedDB.databases() : [];
+    const databases = [];
+    for (const info of dbs) if (info?.name) {
+        try { databases.push(await exportOneIndexedDB(info.name)); }
+        catch (e) { databases.push({ name: info.name, error: String(e?.message || e), stores: [] }); }
+    }
+    const payload = {
+        format: 'ST-Extension-Importer-browser-storage',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        origin: location.origin,
+        localStorage: localStorageData,
+        indexedDB: databases,
+    };
+    const json = new TextEncoder().encode(JSON.stringify(payload));
+    const blob = makeStoredZip([
+        { name: 'stei-data.json', bytes: json },
+    ]);
+    dataPackageDownload(blob, `ST-Extension-Importer-data-${new Date().toISOString().replace(/[:.]/g, '-')}.zip`);
+    return { localStorageCount: Object.keys(localStorageData).length, indexedDBCount: databases.length };
+}
+
+async function importIndexedDBDatabase(database) {
+    if (!database?.name || !Array.isArray(database.stores)) return;
+    const version = Math.max(1, Number(database.version) || 1);
+    const db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open(database.name, version);
+        req.onupgradeneeded = () => {
+            const d = req.result;
+            for (const meta of database.stores) {
+                if (d.objectStoreNames.contains(meta.name)) continue;
+                const store = d.createObjectStore(meta.name, { keyPath: meta.keyPath ?? undefined, autoIncrement: !!meta.autoIncrement });
+                for (const idx of meta.indexes || []) { try { store.createIndex(idx.name, idx.keyPath, { unique: !!idx.unique, multiEntry: !!idx.multiEntry }); } catch {} }
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error || new Error(`创建 IndexedDB 失败：${database.name}`));
+    });
+    for (const meta of database.stores) {
+        if (!db.objectStoreNames.contains(meta.name)) continue;
+        const tx = db.transaction(meta.name, 'readwrite'); const store = tx.objectStore(meta.name);
+        for (const pair of meta.records || []) {
+            try {
+                const key = await importStorageValue(pair[0]); const value = await importStorageValue(pair[1]);
+                if (meta.keyPath == null && key !== undefined) store.put(value, key); else store.put(value);
+            } catch (e) { console.warn('[ST Extension Importer] IndexedDB record skipped', database.name, meta.name, e); }
+        }
+        await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted')); });
+    }
+    db.close();
+}
+
+async function importDataPackageFromInput(file) {
+    const parsed = await parseZip(await file.arrayBuffer());
+    const dataEntry = parsed.entries.find(e => e.name === 'stei-data.json' && !e.directory);
+    if (!dataEntry) throw new Error('不是 ST Extension Importer 浏览器数据包：缺少 stei-data.json');
+    const payload = JSON.parse(new TextDecoder().decode(await parsed.readEntry(dataEntry)));
+    if (payload.format !== 'ST-Extension-Importer-browser-storage') throw new Error('数据包格式不受支持');
+    let ls = 0, dbCount = 0;
+    for (const [key, value] of Object.entries(payload.localStorage || {})) {
+        if (localStorage.getItem(key) === null) { localStorage.setItem(key, String(value)); ls++; }
+    }
+    for (const db of payload.indexedDB || []) { try { await importIndexedDBDatabase(db); dbCount++; } catch (e) { console.warn('[ST Extension Importer] IndexedDB database skipped', db?.name, e); } }
+    setStatus(`浏览器数据导入完成：补充 localStorage ${ls} 项，处理 IndexedDB ${dbCount} 个数据库。建议重新加载 TT。`);
+    notify('success', `插件浏览器数据已导入：${ls} 项 localStorage，${dbCount} 个 IndexedDB`);
 }
 
 function selectAll(value) {
