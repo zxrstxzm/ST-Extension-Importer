@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.8.5';
+const VERSION = '0.8.7';
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024 * 1024;
@@ -42,6 +42,35 @@ async function fsInvoke(command, args, body, headers) {
 function setStatus(text, muted = false) {
     $('#stei_status').text(String(text || ''))
         .toggleClass('stei-muted', muted);
+}
+
+function notify(type, message, title = 'ST Extension Importer') {
+    const fn = window.toastr?.[type];
+    if (typeof fn === 'function') {
+        fn(String(message || ''), title, {
+            timeOut: 2800,
+            extendedTimeOut: 1200,
+            closeButton: true,
+            progressBar: true,
+            preventDuplicates: true,
+            newestOnTop: true,
+        });
+    }
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+    const results = new Array(items.length);
+    let next = 0;
+    const count = Math.max(1, Math.min(Number(limit) || 1, items.length || 1));
+    async function runner() {
+        while (true) {
+            const index = next++;
+            if (index >= items.length) return;
+            results[index] = await worker(items[index], index);
+        }
+    }
+    await Promise.all(Array.from({ length: count }, runner));
+    return results;
 }
 
 function escapeHtml(value) {
@@ -435,25 +464,31 @@ async function buildNativeExtensionArchive(items) {
         }
         if (prepared?.manifestEntry) requiredResourcePaths.add(normalizeResourcePathForMatch(prepared.manifestEntry.name));
 
-        for (const entry of item.fileList || []) {
-            if (entry.directory) continue;
+        const runtimeEntries = (item.fileList || []).map(entry => {
+            if (entry.directory) return null;
             const rel = safeZipRelativePath(item, entry);
-            if (!rel || !isRuntimeImportableRelativePath(rel)) continue;
-
+            if (!rel || !isRuntimeImportableRelativePath(rel)) return null;
             const name = `extensions/third-party/${root}/${rel}`;
-            if (seen.has(name)) continue;
+            if (seen.has(name)) return null;
             seen.add(name);
+            return { entry, rel, name };
+        }).filter(Boolean);
 
+        // Reading ZIP members one-by-one made large GitHub archives feel frozen.
+        // Read a few independent members concurrently; the archive itself is
+        // still assembled deterministically in the original order.
+        const built = await mapWithConcurrency(runtimeEntries, 4, async ({ entry, rel, name }) => {
             let bytes = await readExtensionEntryBytes(item, entry);
             if (prepared?.manifestEntry && entry === prepared.manifestEntry && item.ttManifest) {
                 bytes = new TextEncoder().encode(`${JSON.stringify(item.ttManifest, null, 2)}\n`);
             }
-            archiveEntries.push({
+            return {
                 name,
                 bytes,
                 requiredByManifest: requiredResourcePaths.has(normalizeResourcePathForMatch(rel)),
-            });
-        }
+            };
+        });
+        archiveEntries.push(...built);
     }
 
     if (!archiveEntries.length) {
@@ -1527,7 +1562,7 @@ async function handlePickFolderPath(path) {
     } catch (error) {
         entries = [];
         setStatus(`扫描失败：${error?.message || error}`);
-        window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
+        notify('error', error?.message || String(error));
     }
 }
 
@@ -1740,7 +1775,7 @@ async function handlePickExtensionFiles() {
     } catch (error) {
         entries = [];
         setStatus(`扫描失败：${error?.message || error}`);
-        window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
+        notify('error', error?.message || String(error));
     }
 }
 
@@ -1755,7 +1790,7 @@ async function handleScanManualPath() {
         await handlePickFolderPath(path);
     } catch (error) {
         setStatus(`扫描失败：${error?.message || error}`);
-        window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
+        notify('error', error?.message || String(error));
     }
 }
 
@@ -1769,7 +1804,7 @@ async function handlePickFolder() {
         await handlePickFolderPath(path);
     } catch (error) {
         setStatus(`选择文件夹失败：${error?.message || error}`);
-        window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
+        notify('error', error?.message || String(error));
     }
 }
 
@@ -1842,7 +1877,7 @@ async function handlePick(files) {
         selectedZips = [];
         entries = [];
         setStatus(`扫描失败：${error?.message || error}`);
-        window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
+        notify('error', error?.message || String(error));
     }
 }
 
@@ -1869,7 +1904,7 @@ function bytesToBase64(bytes) {
 }
 
 async function stageArchiveBlobForTT(blob) {
-    const invoke = rawTauriInvoke();
+    const invoke = getSafeInvoke();
     let filePath = '';
     try {
         const begin = await invoke('stage_upload_begin', {
@@ -1884,8 +1919,10 @@ async function stageArchiveBlobForTT(blob) {
             const end = Math.min(offset + chunkSize, blob.size);
             const chunk = new Uint8Array(await blob.slice(offset, end).arrayBuffer());
             let nextOffset;
+            const raw = window.__TAURI__?.core?.invoke;
+            if (typeof raw !== 'function') throw new Error('Tauri invoke API 不可用');
             if (/android/i.test(navigator.userAgent || '')) {
-                nextOffset = await invoke('stage_upload_chunk', { data: bytesToBase64(chunk) }, {
+                nextOffset = await raw('stage_upload_chunk', { data: bytesToBase64(chunk) }, {
                     headers: {
                         'chunk-encoding': 'base64',
                         'file-path': encodeURIComponent(filePath),
@@ -1893,7 +1930,7 @@ async function stageArchiveBlobForTT(blob) {
                     },
                 });
             } else {
-                nextOffset = await invoke('stage_upload_chunk', chunk, {
+                nextOffset = await raw('stage_upload_chunk', chunk, {
                     headers: {
                         'file-path': encodeURIComponent(filePath),
                         offset: String(offset),
@@ -1902,13 +1939,19 @@ async function stageArchiveBlobForTT(blob) {
             }
             offset = Number(nextOffset);
             if (offset !== end) throw new Error(`TT 归档暂存偏移异常：${offset} / ${end}`);
+            if (blob.size > 4 * 1024 * 1024) {
+                setStatus(`正在上传整理后的归档… ${Math.round(offset / blob.size * 100)}%`, true);
+            }
         }
 
+        // IMPORTANT: use TT's safeInvoke wrapper. It adds the camelCase aliases
+        // required by the Tauri command bridge (file_path -> filePath), while
+        // preserving the snake_case names used by TT's own JS service.
         const finished = await invoke('stage_upload_finish', {
             file_path: filePath,
             expected_size: blob.size,
         });
-        const finishedPath = String(finished?.file_path || filePath).trim();
+        const finishedPath = String(finished?.file_path || finished?.filePath || filePath).trim();
         if (!finishedPath) throw new Error('TT 没有返回完成后的归档路径');
         filePath = finishedPath;
         return {
@@ -1928,9 +1971,9 @@ async function stageArchiveBlobForTT(blob) {
 async function requestTTArchiveImportFromBlob(blob) {
     const staged = await stageArchiveBlobForTT(blob);
     try {
-        const jobId = String(await rawTauriInvoke()('start_import_data_archive', {
-            archivePath: staged.filePath,
-            archiveIsTemporary: true,
+        const jobId = String(await getSafeInvoke()('start_import_data_archive', {
+            archive_path: staged.filePath,
+            archive_is_temporary: true,
         }) || '').trim();
         if (!jobId) throw new Error('TauriTavern 未返回归档导入任务 ID');
         return await waitNativeArchiveImport(jobId);
@@ -2014,68 +2057,73 @@ async function cleanupFailedNewExtensionDirs(items, dataRoot) {
 async function importSelected() {
     const selected = selectedEntries();
     if (!selected.length) return setStatus('没有选择要导入的扩展。');
+    $('#stei_import').prop('disabled', true).addClass('stei-busy');
     try {
         await getInstallContext();
-        const results = [];
-        $('#stei_import').prop('disabled', true);
-        setStatus(`开始通过 TT 原生归档引擎逐个导入 ${selected.length} 个扩展…`);
+        setStatus(`正在预检查 ${selected.length} 个扩展…`);
 
-        for (let i = 0; i < selected.length; i++) {
-            const item = selected[i];
-            const folder = extensionFolderKey(item);
-            const existedBefore = Boolean(item.existing);
-            setStatus(`正在导入 ${i + 1}/${selected.length}：${item.displayName}…`);
+        // Preflight independently so one broken extension does not poison the
+        // whole batch. Only valid packages enter the single native archive job.
+        const preflight = await mapWithConcurrency(selected, 4, async (item, index) => {
             try {
-                // Build a one-extension DataRoot archive. This is deliberately
-                // installed by TT's backend archive service rather than the
-                // WebView fs plugin, which is forbidden from touching Android's
-                // /storage path.
-                const archive = await buildNativeExtensionArchive([item]);
-                const status = await requestTTArchiveImportFromBlob(archive);
-                if (String(status?.state || '').toLowerCase() !== 'completed') {
-                    throw new Error(String(status?.error || status?.message || 'TT 原生归档导入失败'));
+                const prepared = await prepareManifestForTT(item, item.zip || selectedZipForItem(item));
+                if (item.ttManifestMissing?.length) {
+                    throw new Error(`manifest 引用了不存在的文件：${item.ttManifestMissing.join('、')}`);
                 }
-
-                const validAfter = await isInstalledExtensionViaHost(folder);
-                if (!validAfter) {
-                    // A completed archive job without a loadable manifest is not
-                    // considered an installation. Clean it through TT's backend
-                    // instead of touching the protected filesystem from Android.
-                    const list = await getSafeInvoke()('get_extensions');
-                    const installed = Array.isArray(list)
-                        ? list.find(x => String(x?.name || '').toLowerCase() === `third-party/${folder}`.toLowerCase())
-                        : null;
-                    if (installed) {
-                        try {
-                            await deleteExtensionViaHost(`third-party/${folder}`, String(installed?.extension_type || '').toLowerCase() === 'global');
-                        } catch {}
-                    }
-                    throw new Error('TT 归档导入完成，但扩展 manifest / JS / CSS 仍无法加载');
-                }
-
-                item.existing = true;
-                results.push({ item, ok: true, existedBefore, error: '' });
+                if (item.ttRequiresNewerST) item.ttWarning = '该扩展声明需要高于 TauriTavern 当前 SillyTavern 1.18.0 兼容基线的版本；未强行降低版本要求。';
+                if (item.ttManifest) item.meta = item.ttManifest;
+                await validateManifestResources(item);
+                setStatus(`预检查 ${index + 1}/${selected.length}：${item.displayName}`, true);
+                return { item, ok: true, error: '' };
             } catch (error) {
-                const message = error?.message || String(error);
-                const validAfter = await isInstalledExtensionViaHost(folder);
-                if (!validAfter) {
-                    item.existing = false;
-                    // Remove a newly-created broken/partial directory through TT's
-                    // extension management API. Never use /storage paths here.
-                    const list = await getSafeInvoke()('get_extensions');
-                    const installed = Array.isArray(list)
-                        ? list.find(x => String(x?.name || '').toLowerCase() === `third-party/${folder}`.toLowerCase())
-                        : null;
-                    if (installed) {
-                        try {
-                            await deleteExtensionViaHost(`third-party/${folder}`, String(installed?.extension_type || '').toLowerCase() === 'global');
-                        } catch {}
-                    }
-                } else {
-                    item.existing = true;
-                }
-                results.push({ item, ok: false, existedBefore, error: message });
+                return { item, ok: false, error: error?.message || String(error) };
             }
+        });
+
+        const ready = preflight.filter(x => x.ok).map(x => x.item);
+        const results = preflight.filter(x => !x.ok).map(x => ({
+            item: x.item,
+            ok: false,
+            existedBefore: Boolean(x.item.existing),
+            error: x.error,
+        }));
+
+        if (ready.length) {
+            setStatus(`正在生成 ${ready.length} 个扩展的统一归档…`);
+            // One native archive job for the whole selection is dramatically
+            // faster on Android than starting/staging one archive per extension.
+            const archive = await buildNativeExtensionArchive(ready);
+            setStatus(`正在上传统一归档（${Math.round(archive.size / 1024 / 1024)} MB）…`);
+            const status = await requestTTArchiveImportFromBlob(archive);
+            if (String(status?.state || '').toLowerCase() !== 'completed') {
+                throw new Error(String(status?.error || status?.message || 'TT 原生归档导入失败'));
+            }
+
+            setStatus('归档已导入，正在逐个验证扩展加载资源…');
+            const verified = await mapWithConcurrency(ready, 4, async item => {
+                const folder = extensionFolderKey(item);
+                const existedBefore = Boolean(item.existing);
+                try {
+                    const validAfter = await isInstalledExtensionViaHost(folder);
+                    if (!validAfter) {
+                        const list = await getSafeInvoke()('get_extensions');
+                        const installed = Array.isArray(list)
+                            ? list.find(x => String(x?.name || '').toLowerCase() === `third-party/${folder}`.toLowerCase())
+                            : null;
+                        if (installed) {
+                            try { await deleteExtensionViaHost(`third-party/${folder}`, String(installed?.extension_type || '').toLowerCase() === 'global'); } catch {}
+                        }
+                        throw new Error('TT 已完成归档导入，但 manifest / JS / CSS 未能通过加载验证');
+                    }
+                    item.existing = true;
+                    return { item, ok: true, existedBefore, error: '' };
+                } catch (error) {
+                    const message = error?.message || String(error);
+                    item.existing = existedBefore;
+                    return { item, ok: false, existedBefore, error: message };
+                }
+            });
+            results.push(...verified);
         }
 
         const okCount = results.filter(x => x.ok).length;
@@ -2088,17 +2136,17 @@ async function importSelected() {
         $('#stei_result').html(`<div class="stei-result-title">导入结果</div><div class="stei-result-lines">${lines.map(escapeHtml).join('<br>')}</div>`).show();
         renderList(entries);
         if (failCount === 0) {
-            setStatus(`导入完成：${okCount} 个扩展逐个通过 TT 原生加载验证。建议重新加载 TT。`);
-            window.toastr?.success?.(`ST 扩展导入完成：${okCount} 个`, 'ST Extension Importer');
+            setStatus(`导入完成：${okCount} 个扩展全部通过 TT 原生加载验证。建议重新加载 TT。`);
+            notify('success', `ST 扩展导入完成：${okCount} 个`);
         } else {
             setStatus(`导入结束：${okCount} 个成功，${failCount} 个未安装/保留旧版本。`);
-            window.toastr?.error?.(`有 ${failCount} 个扩展未通过安装验证，请查看下方逐项结果。`, 'ST Extension Importer');
+            notify('error', `有 ${failCount} 个扩展未通过安装验证，请查看下方逐项结果。`);
         }
     } catch (error) {
         setStatus(`导入失败：${error?.message || error}`);
-        window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
+        notify('error', error?.message || String(error));
     } finally {
-        $('#stei_import').prop('disabled', false);
+        $('#stei_import').prop('disabled', false).removeClass('stei-busy');
     }
 }
 

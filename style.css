@@ -45,3 +45,16 @@
 .stei-body { margin-top:0; }
 
 .stei-manual-path{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}.stei-manual-path input{flex:1;min-width:220px;padding:8px}.stei-manual-path button{white-space:nowrap}
+
+
+/* v0.8.7 touch/click fixes */
+.stei-panel { position: relative; z-index: 1; }
+.stei-header { min-height: 44px; -webkit-tap-highlight-color: transparent; }
+.stei-header-main, .stei-header-right, .stei-collapse-icon { pointer-events: none; }
+.stei-toolbar button, .stei-actions button {
+  position: relative; z-index: 3; min-height: 42px; min-width: 96px;
+  touch-action: manipulation; cursor: pointer; pointer-events: auto;
+}
+.stei-actions { position: relative; z-index: 3; }
+.stei-primary { min-width: 128px !important; }
+.stei-status { overflow-wrap: anywhere; }
