@@ -92,7 +92,7 @@ extensions/
 
 将本仓库直接安装到 TauriTavern 的第三方扩展目录。
 
-## v0.9.1
+## v0.9.2
 
 增加“插件浏览器数据迁移”功能，用于把旧 SillyTavern WebView 中的浏览器存储带到 TauriTavern。
 
@@ -111,3 +111,9 @@ extensions/
 
 ### 关于插件数据迁移
 插件文件与 `data/` 文件迁移和浏览器存储迁移是两件事。`localStorage`、IndexedDB 属于旧 SillyTavern WebView 的浏览器存储空间，不能从 TauriTavern 端直接读取旧应用的 WebView 存储；SQLite 则需要知道数据库实际路径/归属。后续的数据迁移应采用“旧 ST 导出 → TT 导入”的专用数据包，而不是把所有浏览器存储直接覆盖到 TT。
+
+
+## v0.9.2
+- 修复 Android WebView 导出 IndexedDB 时事务被异步序列化打断导致卡住的问题。
+- 导出过程增加阶段进度提示，避免点击后无反馈。
+- IndexedDB 先快速读取记录，再在事务结束后序列化。

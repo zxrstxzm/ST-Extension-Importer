@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.9.2';
+const VERSION = '0.9.1';
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024 * 1024;
@@ -2253,10 +2253,7 @@ function openIndexedDB(name, version) {
 async function exportOneIndexedDB(name) {
     const db = await openIndexedDB(name);
     const stores = [];
-    const storeNames = Array.from(db.objectStoreNames);
-    for (let storeIndex = 0; storeIndex < storeNames.length; storeIndex++) {
-        const storeName = storeNames[storeIndex];
-        setStatus(`正在读取 IndexedDB：${name} / ${storeName}（${storeIndex + 1}/${storeNames.length}）…`);
+    for (const storeName of Array.from(db.objectStoreNames)) {
         const tx = db.transaction(storeName, 'readonly');
         const store = tx.objectStore(storeName);
         const meta = {
@@ -2269,34 +2266,18 @@ async function exportOneIndexedDB(name) {
             }),
             records: []
         };
-
-        // IMPORTANT: do not await while an IDB cursor transaction is active.
-        // Awaiting Blob/ArrayBuffer serialization here can make the transaction
-        // inactive before cursor.continue(), which is especially problematic on Android WebView.
-        const rawRecords = await new Promise((resolve, reject) => {
-            const req = store.openCursor();
-            const out = [];
-            req.onsuccess = e => {
+        const records = await new Promise((resolve, reject) => {
+            const req = store.openCursor(); const out = [];
+            req.onsuccess = async e => {
                 const cursor = e.target.result;
-                if (!cursor) { resolve(out); return; }
-                out.push([cursor.key, cursor.value]);
+                if (!cursor) return resolve(out);
+                out.push([await exportStorageValue(cursor.key), await exportStorageValue(cursor.value)]);
                 cursor.continue();
             };
-            req.onerror = () => reject(req.error || new Error(`读取 IndexedDB 失败：${name}/${storeName}`));
-            tx.onerror = () => reject(tx.error || new Error(`读取 IndexedDB 事务失败：${name}/${storeName}`));
-            tx.onabort = () => reject(tx.error || new Error(`IndexedDB 事务被中止：${name}/${storeName}`));
+            req.onerror = () => reject(req.error);
         });
-        // The transaction is finished now; expensive async value serialization is safe.
-        for (let i = 0; i < rawRecords.length; i++) {
-            if ((i & 31) === 0) {
-                setStatus(`正在整理 IndexedDB：${name} / ${storeName}（${i}/${rawRecords.length}）…`);
-                await new Promise(r => setTimeout(r, 0));
-            }
-            const pair = rawRecords[i];
-            meta.records.push([await exportStorageValue(pair[0]), await exportStorageValue(pair[1])]);
-        }
+        meta.records = records;
         stores.push(meta);
-        await new Promise(r => setTimeout(r, 0));
     }
     const version = db.version;
     db.close();
@@ -2304,8 +2285,33 @@ async function exportOneIndexedDB(name) {
 }
 
 async function exportBrowserStoragePackage() {
-    setStatus('正在读取 localStorage…');
-    await new Promise(r => setTimeout(r, 0));
+    const localStorageData = {};
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i); if (key == null) continue;
+        localStorageData[key] = localStorage.getItem(key);
+    }
+    const dbs = typeof indexedDB.databases === 'function' ? await indexedDB.databases() : [];
+    const databases = [];
+    for (const info of dbs) if (info?.name) {
+        try { databases.push(await exportOneIndexedDB(info.name)); }
+        catch (e) { databases.push({ name: info.name, error: String(e?.message || e), stores: [] }); }
+    }
+    const payload = {
+        format: 'ST-Extension-Importer-browser-storage',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        origin: location.origin,
+        localStorage: localStorageData,
+        indexedDB: databases,
+    };
+    const json = new TextEncoder().encode(JSON.stringify(payload));
+    const blob = makeStoredZip([
+        { name: 'stei-data.json', bytes: json },
+    ]);
+    dataPackageDownload(blob, `ST-Extension-Importer-data-${new Date().toISOString().replace(/[:.]/g, '-')}.zip`);
+    return { localStorageCount: Object.keys(localStorageData).length, indexedDBCount: databases.length };
+}
+
 async function importIndexedDBDatabase(database) {
     if (!database?.name || !Array.isArray(database.stores)) return;
     const version = Math.max(1, Number(database.version) || 1);
