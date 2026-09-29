@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.8.2';
+const VERSION = '0.8.5';
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024 * 1024;
@@ -1859,8 +1859,9 @@ async function stageArchiveBlobForTT(blob) {
         }
 
         const finished = await invoke('stage_upload_finish', {
-            file_path: filePath,
-            expected_size: blob.size,
+            // Raw Tauri IPC uses the command's camelCase argument names.
+            filePath,
+            expectedSize: blob.size,
         });
         const finishedPath = String(finished?.file_path || filePath).trim();
         if (!finishedPath) throw new Error('TT 没有返回完成后的归档路径');
@@ -1868,12 +1869,12 @@ async function stageArchiveBlobForTT(blob) {
         return {
             filePath,
             cleanup: async () => {
-                try { await invoke('stage_upload_discard', { file_path: filePath }); } catch {}
+                try { await invoke('stage_upload_discard', { filePath }); } catch {}
             },
         };
     } catch (error) {
         if (filePath) {
-            try { await invoke('stage_upload_discard', { file_path: filePath }); } catch {}
+            try { await invoke('stage_upload_discard', { filePath }); } catch {}
         }
         throw error;
     }
@@ -1883,8 +1884,8 @@ async function requestTTArchiveImportFromBlob(blob) {
     const staged = await stageArchiveBlobForTT(blob);
     try {
         const jobId = String(await rawTauriInvoke()('start_import_data_archive', {
-            archive_path: staged.filePath,
-            archive_is_temporary: true,
+            archivePath: staged.filePath,
+            archiveIsTemporary: true,
         }) || '').trim();
         if (!jobId) throw new Error('TauriTavern 未返回归档导入任务 ID');
         return await waitNativeArchiveImport(jobId);
