@@ -58,3 +58,12 @@
 .stei-actions { position: relative; z-index: 3; }
 .stei-primary { min-width: 128px !important; }
 .stei-status { overflow-wrap: anywhere; }
+
+/* v0.9.0 grouped extension list */
+.stei-group { margin-top: 9px; border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #777) 28%, transparent); border-radius: 9px; overflow: hidden; }
+.stei-group-header { width:100%; min-height:42px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; border:0; color:inherit; background:rgba(128,128,128,.07); cursor:pointer; touch-action:manipulation; text-align:left; }
+.stei-group-header:hover { background:rgba(128,128,128,.12); }
+.stei-group-title { display:flex; align-items:center; gap:7px; font-weight:700; }
+.stei-group-icon { width:1em; opacity:.7; }
+.stei-group-body { display:flex; flex-direction:column; gap:7px; padding:7px; }
+.stei-group-body[hidden] { display:none; }

@@ -755,14 +755,40 @@ function renderItem(item, index) {
 }
 
 function renderList(items) {
-    const thirdParty = items.map((x, i) => [x, i]).filter(([x]) => x.type === 'third-party');
-    const local = items.map((x, i) => [x, i]).filter(([x]) => x.type !== 'third-party');
-    const section = (title, rows) => rows.length
-        ? `<div class="stei-section-title">${title} <span class="stei-badge">${rows.length}</span></div>${rows.map(([x,i]) => renderItem(x,i)).join('')}`
-        : '';
-    $('#stei_list').html(section('第三方扩展', thirdParty) + section('其他 / TT 内置扩展', local));
+    const indexed = items.map((x, i) => [x, i]);
+    const groups = [
+        { key: 'uninstalled', title: '未安装', rows: indexed.filter(([x]) => x.type === 'third-party' && !x.existing), open: true },
+        { key: 'installed', title: '已安装', rows: indexed.filter(([x]) => x.type === 'third-party' && x.existing), open: true },
+        { key: 'builtin', title: 'TT 内置', rows: indexed.filter(([x]) => x.type === 'builtin'), open: false },
+        { key: 'other', title: '其他', rows: indexed.filter(([x]) => x.type !== 'third-party' && x.type !== 'builtin'), open: false },
+    ];
+
+    const section = (group) => {
+        if (!group.rows.length) return '';
+        const id = `stei_group_${group.key}`;
+        return `<section class="stei-group" data-stei-group="${group.key}">
+            <button type="button" class="stei-group-header" data-stei-group-toggle="${group.key}" aria-expanded="${group.open}">
+                <span class="stei-group-title"><span class="stei-group-icon">${group.open ? '▾' : '▸'}</span>${escapeHtml(group.title)}</span>
+                <span class="stei-badge">${group.rows.length}</span>
+            </button>
+            <div id="${id}" class="stei-group-body" ${group.open ? '' : 'hidden'}>${group.rows.map(([x,i]) => renderItem(x,i)).join('')}</div>
+        </section>`;
+    };
+    $('#stei_list').html(groups.map(section).join('') || '<div class="stei-empty">没有扫描到扩展。</div>');
     const importable = items.some(isImportable);
     $('#stei_actions').toggle(importable);
+    $('#stei_list').off('click.steiGroups').on('click.steiGroups', '[data-stei-group-toggle]', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        const key = this.dataset.steiGroupToggle;
+        const body = document.getElementById(`stei_group_${key}`);
+        if (!body) return;
+        const expanded = this.getAttribute('aria-expanded') !== 'true';
+        this.setAttribute('aria-expanded', String(expanded));
+        body.hidden = !expanded;
+        const icon = this.querySelector('.stei-group-icon');
+        if (icon) icon.textContent = expanded ? '▾' : '▸';
+    });
 }
 
 function normalizeFsPath(path) {
@@ -1869,7 +1895,9 @@ async function handlePick(files) {
         const thirdParty = entries.filter(x => x.type === 'third-party').length;
         const builtin = entries.filter(isBuiltin).length;
         const importable = entries.filter(isImportable).length;
-        $('#stei_count').text(`共 ${entries.length} 个 · 第三方 ${thirdParty} · 内置 ${builtin}${duplicateCount ? ` · 重复 ${duplicateCount}` : ''}`);
+        const installedCount = entries.filter(x => x.type === 'third-party' && x.existing).length;
+        const uninstalledCount = entries.filter(x => x.type === 'third-party' && !x.existing).length;
+        $('#stei_count').text(`共 ${entries.length} 个 · 未安装 ${uninstalledCount} · 已安装 ${installedCount} · 内置 ${builtin}${duplicateCount ? ` · 重复 ${duplicateCount}` : ''}`);
         $('#stei_summary').show();
         $('#stei_rescan').show();
         setStatus(`扫描完成：${list.length} 个 ZIP，共 ${importable} 个可导入扩展。${duplicateCount ? ` 已去重 ${duplicateCount} 个重复扩展。` : ''}`, true);
@@ -2178,6 +2206,20 @@ async function init() {
     $('#stei_select_all').on('click', () => selectAll(true));
     $('#stei_select_none').on('click', () => selectAll(false));
     $('#stei_import').on('click', importSelected);
+    $('#stei_export_data').on('click', async () => {
+        try {
+            setStatus('正在导出当前 SillyTavern 浏览器数据（localStorage + IndexedDB）…');
+            const result = await exportBrowserStoragePackage();
+            setStatus(`数据导出完成：localStorage ${result.localStorageCount} 项，IndexedDB ${result.indexedDBCount} 个数据库。请把生成的 ZIP 带到 TauriTavern 再点“导入插件数据包”。`);
+            notify('success', '插件浏览器数据已导出');
+        } catch (error) { setStatus(`数据导出失败：${error?.message || error}`); notify('error', error?.message || String(error)); }
+    });
+    $('#stei_import_data').on('click', () => document.getElementById('stei_data_input')?.click());
+    $('#stei_data_input').on('change', async function () {
+        const file = this.files?.[0]; this.value = '';
+        if (!file) return;
+        try { await importDataPackageFromInput(file); } catch (error) { setStatus(`数据导入失败：${error?.message || error}`); notify('error', error?.message || String(error)); }
+    });
     $('#stei_file_input').on('change', function () {
         const files = [...(this.files || [])];
         this.value = '';

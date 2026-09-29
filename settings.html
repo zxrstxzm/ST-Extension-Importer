@@ -2,10 +2,10 @@
   <button id="stei_header_toggle" class="stei-header" type="button" aria-expanded="true">
     <div class="stei-header-main">
       <div class="stei-title">SillyTavern 扩展迁移器</div>
-      <div class="stei-subtitle">自动整理 ZIP 并做 TT 兼容化：修正 manifest 的 JS/CSS/i18n 资源路径，再交给 TauriTavern 原生归档系统导入。Android 不直接写 /storage，避免 forbidden path。</div>
+      <div class="stei-subtitle">自动整理 ZIP、做 TT 兼容化，并支持旧 SillyTavern 浏览器数据迁移：localStorage + IndexedDB。SQLite/文件型数据继续使用 data 迁移。扫描结果按“未安装 / 已安装 / TT 内置”分类，可折叠并显示数量。Android 不直接写 /storage。</div>
     </div>
     <div class="stei-header-right">
-      <span class="stei-version">v0.8.7</span>
+      <span class="stei-version">v0.9.1</span>
       <span id="stei_collapse_icon" class="stei-collapse-icon">▾</span>
     </div>
   </button>
@@ -14,7 +14,10 @@
     <div class="stei-toolbar">
       <button id="stei_pick" class="menu_button">📦 选择 ZIP（原生导入）</button>
       <button id="stei_rescan" class="menu_button" style="display:none">↻ 重新扫描</button>
+      <button id="stei_export_data" class="menu_button">💾 导出旧 ST 浏览器数据</button>
+      <button id="stei_import_data" class="menu_button">📥 导入插件数据包</button>
       <input id="stei_file_input" type="file" accept=".zip,application/zip,application/x-zip-compressed" multiple style="display:none" />
+      <input id="stei_data_input" type="file" accept=".zip,application/zip,application/x-zip-compressed" style="display:none" />
     </div>
 
     <div id="stei_status" class="stei-status stei-muted">尚未选择扩展。</div>
