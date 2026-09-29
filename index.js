@@ -2250,53 +2250,60 @@ function openIndexedDB(name, version) {
     });
 }
 
-async function exportOneIndexedDB(name) {
+async function exportOneIndexedDB(name, dbIndex = 0, dbTotal = 0) {
+    setStatus(`正在读取 IndexedDB ${dbIndex}/${dbTotal}：${name}…`);
     const db = await openIndexedDB(name);
     const stores = [];
     const storeNames = Array.from(db.objectStoreNames);
+
     for (let storeIndex = 0; storeIndex < storeNames.length; storeIndex++) {
         const storeName = storeNames[storeIndex];
-        setStatus(`正在读取 IndexedDB：${name} / ${storeName}（${storeIndex + 1}/${storeNames.length}）…`);
-        const tx = db.transaction(storeName, 'readonly');
-        const store = tx.objectStore(storeName);
+        setStatus(`正在读取 IndexedDB ${dbIndex}/${dbTotal}：${name} / ${storeName}（${storeIndex + 1}/${storeNames.length}）…`);
         const meta = {
             name: storeName,
-            keyPath: store.keyPath,
-            autoIncrement: store.autoIncrement,
-            indexes: Array.from(store.indexNames).map(indexName => {
-                const idx = store.index(indexName);
-                return { name: indexName, keyPath: idx.keyPath, unique: idx.unique, multiEntry: idx.multiEntry };
-            }),
+            keyPath: null,
+            autoIncrement: false,
+            indexes: [],
             records: []
         };
 
-        // IMPORTANT: do not await while an IDB cursor transaction is active.
-        // Awaiting Blob/ArrayBuffer serialization here can make the transaction
-        // inactive before cursor.continue(), which is especially problematic on Android WebView.
-        const rawRecords = await new Promise((resolve, reject) => {
-            const req = store.openCursor();
-            const out = [];
-            req.onsuccess = e => {
-                const cursor = e.target.result;
-                if (!cursor) { resolve(out); return; }
-                out.push([cursor.key, cursor.value]);
-                cursor.continue();
-            };
-            req.onerror = () => reject(req.error || new Error(`读取 IndexedDB 失败：${name}/${storeName}`));
-            tx.onerror = () => reject(tx.error || new Error(`读取 IndexedDB 事务失败：${name}/${storeName}`));
-            tx.onabort = () => reject(tx.error || new Error(`IndexedDB 事务被中止：${name}/${storeName}`));
+        // IMPORTANT: never await inside an active IndexedDB cursor callback.
+        // Android WebView may auto-close the transaction while the callback is suspended.
+        const raw = await new Promise((resolve, reject) => {
+            let tx;
+            try {
+                tx = db.transaction(storeName, 'readonly');
+                const store = tx.objectStore(storeName);
+                meta.keyPath = store.keyPath;
+                meta.autoIncrement = store.autoIncrement;
+                meta.indexes = Array.from(store.indexNames).map(indexName => {
+                    const idx = store.index(indexName);
+                    return { name: indexName, keyPath: idx.keyPath, unique: idx.unique, multiEntry: idx.multiEntry };
+                });
+                const out = [];
+                const req = store.openCursor();
+                req.onsuccess = e => {
+                    const cursor = e.target.result;
+                    if (!cursor) return;
+                    // Keep the raw structured-clone values while the transaction is active.
+                    out.push([cursor.key, cursor.value]);
+                    cursor.continue();
+                };
+                req.onerror = () => reject(req.error || new Error(`读取 IndexedDB Store 失败：${name}/${storeName}`));
+                tx.oncomplete = () => resolve(out);
+                tx.onerror = () => reject(tx.error || new Error(`读取 IndexedDB 事务失败：${name}/${storeName}`));
+                tx.onabort = () => reject(tx.error || new Error(`读取 IndexedDB 事务中止：${name}/${storeName}`));
+            } catch (e) { reject(e); }
         });
-        // The transaction is finished now; expensive async value serialization is safe.
-        for (let i = 0; i < rawRecords.length; i++) {
-            if ((i & 31) === 0) {
-                setStatus(`正在整理 IndexedDB：${name} / ${storeName}（${i}/${rawRecords.length}）…`);
-                await new Promise(r => setTimeout(r, 0));
+
+        for (let i = 0; i < raw.length; i++) {
+            meta.records.push([await exportStorageValue(raw[i][0]), await exportStorageValue(raw[i][1])]);
+            if ((i + 1) % 50 === 0 || i + 1 === raw.length) {
+                setStatus(`正在导出 ${name} / ${storeName}：${i + 1}/${raw.length} 条…`);
+                await new Promise(resolve => setTimeout(resolve, 0));
             }
-            const pair = rawRecords[i];
-            meta.records.push([await exportStorageValue(pair[0]), await exportStorageValue(pair[1])]);
         }
         stores.push(meta);
-        await new Promise(r => setTimeout(r, 0));
     }
     const version = db.version;
     db.close();
@@ -2305,7 +2312,55 @@ async function exportOneIndexedDB(name) {
 
 async function exportBrowserStoragePackage() {
     setStatus('正在读取 localStorage…');
-    await new Promise(r => setTimeout(r, 0));
+    const localStorageData = {};
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i); if (key == null) continue;
+        localStorageData[key] = localStorage.getItem(key);
+        if ((i + 1) % 100 === 0) {
+            setStatus(`正在读取 localStorage：${i + 1}/${localStorage.length}…`);
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+    }
+
+    setStatus('正在发现 IndexedDB 数据库…');
+    const dbInfos = typeof indexedDB.databases === 'function' ? await indexedDB.databases() : [];
+    const dbList = dbInfos.filter(info => info?.name);
+    const databases = [];
+    for (let i = 0; i < dbList.length; i++) {
+        try {
+            databases.push(await exportOneIndexedDB(dbList[i].name, i + 1, dbList.length));
+        } catch (e) {
+            databases.push({ name: dbList[i].name, error: String(e?.message || e), stores: [] });
+            setStatus(`IndexedDB ${dbList[i].name} 导出失败，继续处理下一个数据库…`);
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+    }
+
+    setStatus('正在生成浏览器数据包…');
+    const payload = {
+        format: 'ST-Extension-Importer-browser-storage',
+        version: 2,
+        exportedAt: new Date().toISOString(),
+        origin: location.origin,
+        localStorage: localStorageData,
+        indexedDB: databases,
+    };
+
+    // JSON.stringify is synchronous and can freeze Android WebView for large datasets.
+    // Give the UI one frame before the final serialization/compression step.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    setStatus('正在序列化浏览器数据（数据较大时可能需要一点时间）…');
+    const jsonText = JSON.stringify(payload);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const json = new TextEncoder().encode(jsonText);
+
+    setStatus(`正在生成 ZIP：${(json.byteLength / 1024 / 1024).toFixed(1)} MB…`);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const blob = makeStoredZip([{ name: 'stei-data.json', bytes: json }]);
+    dataPackageDownload(blob, `ST-Extension-Importer-data-${new Date().toISOString().replace(/[:.]/g, '-')}.zip`);
+    return { localStorageCount: Object.keys(localStorageData).length, indexedDBCount: databases.length };
+}
+
 async function importIndexedDBDatabase(database) {
     if (!database?.name || !Array.isArray(database.stores)) return;
     const version = Math.max(1, Number(database.version) || 1);
