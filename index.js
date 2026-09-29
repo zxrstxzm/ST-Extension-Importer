@@ -1,10 +1,10 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.7.9';
-const MAX_ARCHIVE_BYTES = 1000 * 1024 * 1024;
-const MAX_TOTAL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
-const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
+const VERSION = '0.8.0';
+const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
+const MAX_TOTAL_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
+const MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024 * 1024;
 const MAX_FILES = 100000;
 
 const BUILTIN_NAMES = new Set([
@@ -91,7 +91,7 @@ async function inflateRaw(bytes) {
 
 async function parseZip(arrayBuffer) {
     const bytes = new Uint8Array(arrayBuffer);
-    if (bytes.byteLength > MAX_ARCHIVE_BYTES) throw new Error('ZIP 超过 1000 MB 限制');
+    if (bytes.byteLength > MAX_ARCHIVE_BYTES) throw new Error('ZIP 超过 16 GB 限制；最终导入由 TauriTavern 原生归档系统负责。');
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const eocd = findEndOfCentralDirectory(bytes);
     const count = readU16(view, eocd + 10);
@@ -119,7 +119,7 @@ async function parseZip(arrayBuffer) {
         const directory = name.endsWith('/');
         if (!directory) {
             total += uncompressedSize;
-            if (total > MAX_TOTAL_UNCOMPRESSED) throw new Error('ZIP 解压总大小超过 2 GB');
+            if (total > MAX_TOTAL_UNCOMPRESSED) throw new Error('ZIP 解压总大小超过 64 GB');
         }
         result.push({ name, flags, method, compressedSize, uncompressedSize, localOffset, directory });
         p += 46 + nameLen + extraLen + commentLen;
@@ -1367,46 +1367,189 @@ function selectedEntries() {
         .filter(isImportable);
 }
 
+async function requestNativeArchiveImport(file) {
+    const form = new FormData();
+    form.append('archive', file, file.name || 'st-extension-import.zip');
+    const response = await fetch('/api/extensions/data-migration/import', {
+        method: 'POST',
+        body: form,
+    });
+    if (!response.ok) {
+        const text = await response.text();
+        let message = text;
+        try {
+            const json = JSON.parse(text);
+            message = json?.error || json?.message || text;
+        } catch { /* plain text */ }
+        throw new Error(String(message || '无法启动 TauriTavern 原生归档导入'));
+    }
+    const payload = await response.json();
+    const jobId = String(payload?.job_id || '').trim();
+    if (!jobId) throw new Error('TauriTavern 未返回导入任务 ID');
+    return jobId;
+}
+
+async function getNativeArchiveJobStatus(jobId) {
+    const response = await fetch(`/api/extensions/data-migration/job?id=${encodeURIComponent(jobId)}`, {
+        method: 'GET',
+        cache: 'no-store',
+    });
+    if (!response.ok) {
+        const text = await response.text();
+        let message = text;
+        try {
+            const json = JSON.parse(text);
+            message = json?.error || json?.message || text;
+        } catch { /* plain text */ }
+        throw new Error(String(message || '无法读取导入任务状态'));
+    }
+    return response.json();
+}
+
+async function waitNativeArchiveImport(jobId, onStatus) {
+    const terminal = new Set(['completed', 'failed', 'cancelled']);
+    while (true) {
+        const status = await getNativeArchiveJobStatus(jobId);
+        onStatus?.(status);
+        if (terminal.has(String(status?.state || '').toLowerCase())) return status;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+}
+
+async function cleanupFailedNewExtensionDirs(items, dataRoot) {
+    const removed = [];
+    const errors = [];
+    for (const item of items) {
+        const key = extensionFolderKey(item);
+        // NEVER delete an extension that existed before this import attempt.
+        if (item.existing) continue;
+        const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
+        try {
+            if (await pathExistsAny(targetRoot)) {
+                await remove(targetRoot, { verify: true });
+                removed.push(item.displayName);
+            }
+        } catch (error) {
+            errors.push(`${item.displayName}: ${error?.message || String(error)}`);
+        }
+    }
+    return { removed, errors };
+}
+
+function nativeArchiveLayoutLooksUsable(scanResult) {
+    // TauriTavern's native data-archive importer requires a recognizable
+    // data-root marker. For extension-only migration the safe form is:
+    // extensions/third-party/<extension>/... (optionally data/...).
+    const names = scanResult?.zip?.entries?.map(e => String(e.name || '').replace(/\\/g, '/').replace(/^\/+/, '')) || [];
+    return names.some(name =>
+        name === 'extensions/third-party' ||
+        name.startsWith('extensions/third-party/') ||
+        name === 'data/extensions/third-party' ||
+        name.startsWith('data/extensions/third-party/')
+    );
+}
+
+function nativeArchiveContainsOnlyThirdParty(scanResult) {
+    const names = scanResult?.zip?.entries?.map(e => String(e.name || '').replace(/\\/g, '/').replace(/^\/+/, '')) || [];
+    const files = names.filter(name => name && !name.endsWith('/'));
+    if (!files.length) return false;
+
+    // Do not let the native overlay accidentally restore ST system extensions
+    // or unrelated files. The archive must be an extension-only data-root.
+    return files.every(name =>
+        name.startsWith('extensions/third-party/') ||
+        name.startsWith('data/extensions/third-party/')
+    );
+}
+
 async function importSelected() {
     const selected = selectedEntries();
     if (!selected.length) return setStatus('没有选择要导入的扩展。');
-    if (!selectedZips.length && !selected.some(item => item.sourceFolder)) return setStatus('请先选择 ST 文件夹或 ZIP。');
+    if (selectedFiles.length !== 1) {
+        return setStatus('v0.8.0 的原生归档导入要求一次选择一个 ZIP。先选择一个 ZIP 再导入。');
+    }
+
+    const file = selectedFiles[0];
+    const scanResult = selectedZips[0];
+    if (!scanResult || !nativeArchiveLayoutLooksUsable(scanResult)) {
+        return setStatus('这个 ZIP 不能直接交给 TauriTavern 原生归档导入。ZIP 内部必须包含 extensions/third-party/<插件名>/...（可外包一层 data/）。');
+    }
+    if (!nativeArchiveContainsOnlyThirdParty(scanResult)) {
+        return setStatus('为避免覆盖 TT 内置扩展，这个 ZIP 必须只包含 extensions/third-party/ 下的第三方扩展文件，不能把整个 ST extensions 目录直接交给原生导入。');
+    }
+
+    // The native archive importer applies the whole archive atomically at the
+    // TT data-root layer; it cannot receive our checkbox subset. To avoid lying
+    // about selective import, require all discovered third-party entries to be
+    // selected for the native path.
+    if (selected.length !== entries.filter(isImportable).length) {
+        return setStatus('原生归档导入会整体合并 ZIP。当前 ZIP 需要全选第三方扩展；如需只导入其中几个，请先单独打包这些扩展。');
+    }
 
     try {
-        const dataRoot = await getInstallBaseDir();
-        // 导入迁移器的目标就是把 ST 当前版本完整同步到 TT。
-        // 因此不再逐次询问“是否覆盖”，而是对本次勾选的扩展始终执行
-        // 整目录覆盖：先删除目标扩展目录（无论它当前是目录还是残留文件），
-        // 再从源重新完整复制。这样可以避免旧文件与新文件混杂，也绕开
-        // Android 上最常见的 EEXIST / ENOTDIR 冲突。
-        const overwrite = true;
+        const install = await getInstallContext();
+        const dataRoot = install.baseDir;
+        const before = new Map(entries.map(item => [extensionFolderKey(item), Boolean(item.existing)]));
 
-        const results = [];
-        for (let i = 0; i < selected.length; i++) {
-            const item = selected[i];
-            setStatus(`正在导入 ${i + 1}/${selected.length}：${item.displayName}`);
-            try {
-                if (item.sourceFolder) await importFolderItem(item, dataRoot, overwrite);
-                else await importItem(item, item.zip, dataRoot, overwrite);
-                const installedNow = await existsDir(`${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`);
-                if (!installedNow) throw new Error('导入完成但未检测到目标扩展目录');
-                item.existing = true;
-                results.push({ item, ok: true });
-            } catch (error) {
-                results.push({ item, ok: false, error: error?.message || String(error) });
-            }
+        setStatus(`正在交给 TauriTavern 原生归档系统处理：${file.name}…`);
+        $('#stei_import').prop('disabled', true);
+
+        const jobId = await requestNativeArchiveImport(file);
+        const status = await waitNativeArchiveImport(jobId, status => {
+            const percent = Number(status?.progress_percent);
+            const message = String(status?.message || status?.stage || '正在导入…');
+            setStatus(Number.isFinite(percent) ? `原生导入：${Math.round(percent)}% · ${message}` : `原生导入：${message}`);
+        });
+
+        const failed = String(status?.state || '').toLowerCase() !== 'completed';
+        let cleanup = { removed: [], errors: [] };
+
+        if (failed) {
+            // Native import can report local_applied=true if it failed after some
+            // files were written. Clean only extension directories that were NOT
+            // present before this job, so an existing installation is never
+            // destroyed merely because a new archive failed.
+            cleanup = await cleanupFailedNewExtensionDirs(entries, dataRoot);
         }
 
-        const ok = results.filter(x => x.ok).length;
-        const fail = results.length - ok;
-        const lines = results.map(x => `${x.ok ? '✓' : '✕'} ${x.item.displayName}${x.ok ? '' : `：${x.error}`}`);
-        $('#stei_result').html(`<div class="stei-result-title">导入结果</div>${escapeHtml(lines.join('\n'))}`).show();
-        setStatus(`导入完成：成功 ${ok} 个，失败 ${fail} 个。${ok ? '建议重新加载 TT，让新扩展被发现。' : ''}`);
-        if (ok) window.toastr?.success?.(`ST 扩展导入完成：${ok} 个`, 'ST Extension Importer');
-        if (fail) window.toastr?.error?.(`有 ${fail} 个扩展导入失败`, 'ST Extension Importer');
+        const results = [];
+        for (const item of entries) {
+            const key = extensionFolderKey(item);
+            const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
+            const existsAfter = await existsDir(targetRoot);
+            const existedBefore = before.get(key) === true;
+            const ok = !failed && existsAfter;
+            item.existing = existsAfter;
+            results.push({ item, ok, existsAfter, existedBefore });
+        }
+
+        const okCount = results.filter(x => x.ok).length;
+        const failCount = results.length - okCount;
+        const errorText = String(status?.error || status?.message || '原生归档导入失败');
+        const lines = results.map(x => {
+            if (x.ok) return `✓ ${x.item.displayName}：已安装`;
+            if (x.existsAfter && x.existedBefore) return `⚠ ${x.item.displayName}：导入任务失败，保留原有安装`;
+            return `✕ ${x.item.displayName}：未安装`;
+        });
+        if (cleanup.removed.length) lines.push(`已自动删除失败导入残留：${cleanup.removed.join('、')}`);
+        if (cleanup.errors.length) lines.push(`清理失败：${cleanup.errors.join('；')}`);
+        if (failed) lines.unshift(`原生导入失败：${errorText}`);
+
+        $('#stei_result').html(`<div class="stei-result-title">导入结果</div><div class="stei-result-lines">${lines.map(escapeHtml).join('<br>')}</div>`).show();
+        renderList(entries);
+
+        if (!failed) {
+            setStatus(`导入完成：${okCount} 个扩展已确认存在。建议重新加载 TT。`);
+            window.toastr?.success?.(`ST 扩展原生导入完成：${okCount} 个`, 'ST Extension Importer');
+        } else {
+            setStatus(`导入失败：${okCount} 个确认成功，${failCount} 个未安装；失败的新目录已自动清理。`);
+            window.toastr?.error?.(errorText, 'ST Extension Importer');
+        }
     } catch (error) {
         setStatus(`导入失败：${error?.message || error}`);
         window.toastr?.error?.(error?.message || String(error), 'ST Extension Importer');
+    } finally {
+        $('#stei_import').prop('disabled', false);
     }
 }
 
@@ -1426,8 +1569,6 @@ async function init() {
         $(this).attr('aria-expanded', String(!collapsed));
     });
 
-    $('#stei_pick_local').on('click', handlePickExtensionFiles);
-    $('#stei_manual_scan').on('click', handleScanManualPath);
     $('#stei_pick').on('click', () => {
         const input = document.getElementById('stei_file_input');
         if (!input) {
@@ -1436,7 +1577,7 @@ async function init() {
         }
         input.click();
     });
-    $('#stei_rescan').on('click', () => selectedFolderPath ? handlePickFolderPath(selectedFolderPath) : (selectedFiles.length && handlePick(selectedFiles)));
+    $('#stei_rescan').on('click', () => selectedFiles.length && handlePick(selectedFiles));
     $('#stei_select_all').on('click', () => selectAll(true));
     $('#stei_select_none').on('click', () => selectAll(false));
     $('#stei_import').on('click', importSelected);
