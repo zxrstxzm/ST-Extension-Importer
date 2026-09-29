@@ -2,6 +2,16 @@
 
 用于在 TauriTavern 中迁移 SillyTavern 的第三方扩展。
 
+## v0.8.4
+
+本版本彻底绕开 Android WebView 对 `/storage` 的直接文件写入。
+
+- 不再使用 `plugin:fs` 直接写 TT 的扩展目录，因此不会再出现 `forbidden path: /storage`。
+- 每个扩展单独生成 `extensions/third-party/<插件名>/...` 原生数据归档，由 TauriTavern 后端归档引擎写入真实 data root。
+- 安装结果逐个等待 TT 归档任务完成，再通过 `/scripts/extensions/third-party/...` 实际资源加载验证。
+- TT 发现列表中的残缺旧目录如果 manifest / JS / CSS 无法实际加载，会通过 TT 自己的扩展删除 API 自动清理，不再误显示“已安装”。
+- ZIP 与已选择的 third-party 文件夹都走同一套原生归档安装路径。
+
 ## v0.8.3
 
 本版本增加 **TT 兼容化预处理**：

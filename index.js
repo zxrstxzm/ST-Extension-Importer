@@ -323,6 +323,12 @@ function rewriteManifestResourceValue(value, item, missing) {
     return value;
 }
 
+async function readExtensionEntryBytes(item, entry) {
+    if (item?.zip?.readEntry) return item.zip.readEntry(entry);
+    if (item?.sourceFolder && entry?.path) return readFsFile(entry.path);
+    throw new Error(`无法读取扩展文件：${entry?.name || entry?.path || 'unknown'}`);
+}
+
 async function prepareManifestForTT(item, zip) {
     const manifestEntry = (item.fileList || []).find(e => !e.directory && String(e.name || '').toLowerCase() === 'manifest.json');
     if (!manifestEntry) {
@@ -333,7 +339,7 @@ async function prepareManifestForTT(item, zip) {
 
     let meta;
     try {
-        meta = JSON.parse(new TextDecoder().decode(await zip.readEntry(manifestEntry)));
+        meta = JSON.parse(new TextDecoder().decode(await readExtensionEntryBytes(item, manifestEntry)));
     } catch {
         item.ttManifest = null;
         item.ttManifestMissing = [];
@@ -396,7 +402,7 @@ async function buildNativeExtensionArchive(items) {
             if (seen.has(name)) continue;
             seen.add(name);
 
-            let bytes = await item.zip.readEntry(entry);
+            let bytes = await readExtensionEntryBytes(item, entry);
             if (prepared?.manifestEntry && entry === prepared.manifestEntry && item.ttManifest) {
                 bytes = new TextEncoder().encode(`${JSON.stringify(item.ttManifest, null, 2)}\n`);
             }
@@ -763,6 +769,75 @@ async function collectInstalledExtensionNames(list, thirdPartyRoot) {
     return installed;
 }
 
+function getThirdPartyFolderFromExtensionName(name) {
+    const normalized = String(name || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const parts = normalized.split('/').filter(Boolean);
+    const index = parts.map(x => x.toLowerCase()).lastIndexOf('third-party');
+    return index >= 0 && parts[index + 1] ? parts[index + 1] : '';
+}
+
+function extensionResourceUrl(folder, relativePath) {
+    const clean = normalizeManifestFilePath(relativePath);
+    if (!clean || /^https?:\/\//i.test(clean) || clean.startsWith('//')) return '';
+    const parts = clean.split('/').filter(Boolean).map(part => encodeURIComponent(part));
+    return `/scripts/extensions/third-party/${encodeURIComponent(folder)}/${parts.join('/')}`;
+}
+
+async function fetchExtensionManifest(folder) {
+    const url = extensionResourceUrl(folder, 'manifest.json');
+    if (!url) return null;
+    const response = await fetch(url, { cache: 'no-store' });
+    if (!response.ok) return null;
+    try {
+        const meta = await response.json();
+        return isValidExtensionManifest(meta) ? meta : null;
+    } catch {
+        return null;
+    }
+}
+
+async function isInstalledExtensionViaHost(folder) {
+    const meta = await fetchExtensionManifest(folder);
+    if (!meta) return false;
+
+    const resources = [];
+    for (const key of ['js', 'css']) {
+        const value = meta[key];
+        const values = Array.isArray(value) ? value : [value];
+        for (const rawPath of values) {
+            if (typeof rawPath !== 'string') continue;
+            const rel = normalizeManifestFilePath(rawPath);
+            if (!rel || /^https?:\/\//i.test(rel) || rel.startsWith('//')) continue;
+            resources.push({ type: key, path: rel });
+        }
+    }
+    if (!resources.some(resource => resource.type === 'js')) return false;
+
+    for (const resource of resources) {
+        const url = extensionResourceUrl(folder, resource.path);
+        if (!url) return false;
+        try {
+            const response = await fetch(url, { cache: 'no-store' });
+            if (!response.ok) return false;
+        } catch {
+            return false;
+        }
+    }
+    return true;
+}
+
+async function deleteExtensionViaHost(extensionName, global = false) {
+    const response = await fetch('/api/extensions/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ extensionName, global: Boolean(global) }),
+    });
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(String(text || response.statusText || '删除残留扩展失败'));
+    }
+}
+
 async function getInstallContext() {
     const invoke = getSafeInvoke();
     const list = await invoke('get_extensions');
@@ -772,21 +847,46 @@ async function getInstallContext() {
         const values = [item?.name, item?.path, item?.folder].map(x => normalizeFsPath(x).toLowerCase());
         return values.some(x => x === 'st-extension-importer' || x.endsWith('/st-extension-importer') || x.endsWith('/st-extension-importer/index.js'));
     });
-    const extensionPath = String(self?.path || self?.folder || '').trim();
-    if (!extensionPath) {
-        throw new Error('无法定位 ST Extension Importer 的安装目录，请重新加载扩展后再试');
+
+    const installedThirdParty = new Set();
+    const invalidThirdParty = [];
+    for (const extension of list) {
+        const name = String(extension?.name || '').trim();
+        if (!/^third-party\//i.test(name)) continue;
+        const folder = getThirdPartyFolderFromExtensionName(name);
+        if (!folder || folder.toLowerCase() === 'st-extension-importer') continue;
+
+        const valid = await isInstalledExtensionViaHost(folder);
+        const key = folder.toLowerCase();
+        if (valid) {
+            installedThirdParty.add(key);
+        } else {
+            invalidThirdParty.push({
+                extensionName: name,
+                folder,
+                global: String(extension?.extension_type || '').toLowerCase() === 'global',
+            });
+        }
     }
 
-    const thirdPartyRoot = getThirdPartyRootFromExtensionPath(extensionPath);
-    if (!thirdPartyRoot) {
-        throw new Error('无法确定 TT 的 third-party 安装目录。请确认迁移器本身是安装在 data/extensions/third-party/ST-Extension-Importer。');
+    // TT's discovery list is directory-based, so a broken leftover directory can
+    // appear as "installed" even when manifest.js/css cannot actually load.
+    // Remove only entries that fail the same resource checks the WebView uses.
+    for (const broken of invalidThirdParty) {
+        try {
+            await deleteExtensionViaHost(broken.extensionName, broken.global);
+        } catch (error) {
+            console.warn('Failed to clean broken extension:', broken.extensionName, error);
+        }
     }
 
     return {
-        baseDir: thirdPartyRoot,
-        installedThirdParty: await collectInstalledExtensionNames(list, thirdPartyRoot),
+        installedThirdParty,
         extensions: list,
         self,
+        // No physical filesystem path is exposed here. Android extension
+        // installation is performed through TT's archive service below.
+        baseDir: '',
     };
 }
 
@@ -1553,7 +1653,6 @@ async function handlePickExtensionFiles() {
         }
 
         const install = await getInstallContext();
-        const dataRoot = install.baseDir;
         const all = [];
         const seen = new Set();
         let duplicateCount = 0;
@@ -1708,6 +1807,94 @@ function selectedEntries() {
         .filter(isImportable);
 }
 
+function rawTauriInvoke() {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (typeof invoke !== 'function') throw new Error('Tauri invoke API 不可用');
+    return invoke;
+}
+
+function bytesToBase64(bytes) {
+    let binary = '';
+    const stride = 0x8000;
+    for (let offset = 0; offset < bytes.byteLength; offset += stride) {
+        binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + stride, bytes.byteLength)));
+    }
+    return btoa(binary);
+}
+
+async function stageArchiveBlobForTT(blob) {
+    const invoke = rawTauriInvoke();
+    let filePath = '';
+    try {
+        const begin = await invoke('stage_upload_begin', {
+            dto: { kind: 'generic', preferred_extension: 'zip', size: blob.size },
+        });
+        filePath = String(begin?.file_path || '').trim();
+        const chunkSize = Math.max(1, Number(begin?.chunk_size || 0));
+        if (!filePath || !Number.isFinite(chunkSize)) throw new Error('TT 没有返回有效的归档暂存路径');
+
+        let offset = 0;
+        while (offset < blob.size) {
+            const end = Math.min(offset + chunkSize, blob.size);
+            const chunk = new Uint8Array(await blob.slice(offset, end).arrayBuffer());
+            let nextOffset;
+            if (/android/i.test(navigator.userAgent || '')) {
+                nextOffset = await invoke('stage_upload_chunk', { data: bytesToBase64(chunk) }, {
+                    headers: {
+                        'chunk-encoding': 'base64',
+                        'file-path': encodeURIComponent(filePath),
+                        offset: String(offset),
+                    },
+                });
+            } else {
+                nextOffset = await invoke('stage_upload_chunk', chunk, {
+                    headers: {
+                        'file-path': encodeURIComponent(filePath),
+                        offset: String(offset),
+                    },
+                });
+            }
+            offset = Number(nextOffset);
+            if (offset !== end) throw new Error(`TT 归档暂存偏移异常：${offset} / ${end}`);
+        }
+
+        const finished = await invoke('stage_upload_finish', {
+            file_path: filePath,
+            expected_size: blob.size,
+        });
+        const finishedPath = String(finished?.file_path || filePath).trim();
+        if (!finishedPath) throw new Error('TT 没有返回完成后的归档路径');
+        filePath = finishedPath;
+        return {
+            filePath,
+            cleanup: async () => {
+                try { await invoke('stage_upload_discard', { file_path: filePath }); } catch {}
+            },
+        };
+    } catch (error) {
+        if (filePath) {
+            try { await invoke('stage_upload_discard', { file_path: filePath }); } catch {}
+        }
+        throw error;
+    }
+}
+
+async function requestTTArchiveImportFromBlob(blob) {
+    const staged = await stageArchiveBlobForTT(blob);
+    try {
+        const jobId = String(await rawTauriInvoke()('start_import_data_archive', {
+            archive_path: staged.filePath,
+            archive_is_temporary: true,
+        }) || '').trim();
+        if (!jobId) throw new Error('TauriTavern 未返回归档导入任务 ID');
+        return await waitNativeArchiveImport(jobId);
+    } finally {
+        // start_import_data_archive prepares/copies the archive synchronously
+        // before returning the job id, so the staging file can be discarded now.
+        await staged.cleanup();
+    }
+}
+
 async function requestNativeArchiveImport(file) {
     const form = new FormData();
     form.append('archive', file, file.name || 'st-extension-import.zip');
@@ -1782,41 +1969,69 @@ async function importSelected() {
     const selected = selectedEntries();
     if (!selected.length) return setStatus('没有选择要导入的扩展。');
     try {
-        const install = await getInstallContext();
-        const dataRoot = install.baseDir;
+        await getInstallContext();
         const results = [];
         $('#stei_import').prop('disabled', true);
-        setStatus(`开始逐个导入 ${selected.length} 个扩展…`);
+        setStatus(`开始通过 TT 原生归档引擎逐个导入 ${selected.length} 个扩展…`);
 
-        // Android's /api/extensions/data-migration/import is intentionally a
-        // native data-archive flow. Do not POST a generated extension ZIP there:
-        // Android rejects WebView-uploaded archives with "must use the native
-        // archive picker". An extension package is instead copied directly into
-        // TT's third-party filesystem layout, with manifest resources normalized.
         for (let i = 0; i < selected.length; i++) {
             const item = selected[i];
-            const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
+            const folder = extensionFolderKey(item);
             const existedBefore = Boolean(item.existing);
             setStatus(`正在导入 ${i + 1}/${selected.length}：${item.displayName}…`);
             try {
-                if (item.sourceFolder) await importFolderItem(item, dataRoot, false);
-                else await importItem(item, item.zip || selectedZipForItem(item), dataRoot, false);
-                const validAfter = await existsDir(targetRoot) && await isInstalledExtensionDirectory(targetRoot);
-                if (!validAfter) throw new Error('导入完成但未通过安装后验证：manifest 或 JS/CSS 资源不完整');
+                // Build a one-extension DataRoot archive. This is deliberately
+                // installed by TT's backend archive service rather than the
+                // WebView fs plugin, which is forbidden from touching Android's
+                // /storage path.
+                const archive = await buildNativeExtensionArchive([item]);
+                const status = await requestTTArchiveImportFromBlob(archive);
+                if (String(status?.state || '').toLowerCase() !== 'completed') {
+                    throw new Error(String(status?.error || status?.message || 'TT 原生归档导入失败'));
+                }
+
+                const validAfter = await isInstalledExtensionViaHost(folder);
+                if (!validAfter) {
+                    // A completed archive job without a loadable manifest is not
+                    // considered an installation. Clean it through TT's backend
+                    // instead of touching the protected filesystem from Android.
+                    const list = await getSafeInvoke()('get_extensions');
+                    const installed = Array.isArray(list)
+                        ? list.find(x => String(x?.name || '').toLowerCase() === `third-party/${folder}`.toLowerCase())
+                        : null;
+                    if (installed) {
+                        try {
+                            await deleteExtensionViaHost(`third-party/${folder}`, String(installed?.extension_type || '').toLowerCase() === 'global');
+                        } catch {}
+                    }
+                    throw new Error('TT 归档导入完成，但扩展 manifest / JS / CSS 仍无法加载');
+                }
+
                 item.existing = true;
                 results.push({ item, ok: true, existedBefore, error: '' });
             } catch (error) {
                 const message = error?.message || String(error);
-                const validAfter = await existsDir(targetRoot) && await isInstalledExtensionDirectory(targetRoot);
-                if (!validAfter && !existedBefore) {
-                    try { await remove(targetRoot, { verify: true }); } catch {}
+                const validAfter = await isInstalledExtensionViaHost(folder);
+                if (!validAfter) {
                     item.existing = false;
+                    // Remove a newly-created broken/partial directory through TT's
+                    // extension management API. Never use /storage paths here.
+                    const list = await getSafeInvoke()('get_extensions');
+                    const installed = Array.isArray(list)
+                        ? list.find(x => String(x?.name || '').toLowerCase() === `third-party/${folder}`.toLowerCase())
+                        : null;
+                    if (installed) {
+                        try {
+                            await deleteExtensionViaHost(`third-party/${folder}`, String(installed?.extension_type || '').toLowerCase() === 'global');
+                        } catch {}
+                    }
                 } else {
-                    item.existing = validAfter;
+                    item.existing = true;
                 }
                 results.push({ item, ok: false, existedBefore, error: message });
             }
         }
+
         const okCount = results.filter(x => x.ok).length;
         const failCount = results.length - okCount;
         const lines = results.map(x => {
@@ -1827,7 +2042,7 @@ async function importSelected() {
         $('#stei_result').html(`<div class="stei-result-title">导入结果</div><div class="stei-result-lines">${lines.map(escapeHtml).join('<br>')}</div>`).show();
         renderList(entries);
         if (failCount === 0) {
-            setStatus(`导入完成：${okCount} 个扩展逐个验证通过。建议重新加载 TT。`);
+            setStatus(`导入完成：${okCount} 个扩展逐个通过 TT 原生加载验证。建议重新加载 TT。`);
             window.toastr?.success?.(`ST 扩展导入完成：${okCount} 个`, 'ST Extension Importer');
         } else {
             setStatus(`导入结束：${okCount} 个成功，${failCount} 个未安装/保留旧版本。`);
