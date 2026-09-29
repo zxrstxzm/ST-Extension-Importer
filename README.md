@@ -2,29 +2,49 @@
 
 用于在 TauriTavern 中迁移 SillyTavern 的第三方扩展。
 
-## v0.8.0
+## v0.8.1
 
-本版本不再通过前端 `plugin:fs|write_file` 直接写入 TT 的数据目录。ZIP 导入改为调用 TauriTavern 已有的数据归档导入接口，由 TT 后端负责写入 `data/extensions/third-party/`，避免 Android `/storage` 的 `forbidden path`。
+本版本会先在前端把选中的 SillyTavern / GitHub ZIP 规范化为 TauriTavern 原生归档格式，再交给 TT 后端导入。
 
-### ZIP 格式
+因此以下 ZIP 都可以直接导入：
 
-为了让 TT 原生归档系统识别，ZIP 根目录必须是：
+```text
+插件文件直接在 ZIP 根目录：
+manifest.json
+index.js
+style.css
+...
+
+GitHub 仓库 ZIP：
+SomeExtension-main/
+├── manifest.json
+├── index.js
+└── ...
+
+传统 ST third-party ZIP：
+extensions/
+└── third-party/
+    └── SomeExtension/
+        ├── manifest.json
+        └── ...
+```
+
+迁移器会统一转换成：
 
 ```text
 extensions/
 └── third-party/
-    ├── Cocktail/
-    ├── 心迹回廊/
-    └── 其他插件/
+    └── <插件名>/
+        └── ...
 ```
 
-也可以外包一层 `data/`：
+所以不再要求用户手工重新打包 ZIP，也不再因为 ZIP 根目录不是 `extensions/third-party/` 而直接报错。
 
-```text
-data/extensions/third-party/...
-```
+## v0.8.0
 
-不要把整个 `public/scripts/extensions/` 打进去；迁移器只接受第三方扩展目录，避免覆盖 TT 内置扩展。
+本版本开始使用 TauriTavern 已有的数据归档导入接口，由 TT 后端负责写入数据目录，避免 Android `/storage` 的 `forbidden path`。
+
+v0.8.1 在此基础上增加了 ZIP 规范化，因此用户无需手工准备原生归档目录。
 
 ### 导入失败清理
 

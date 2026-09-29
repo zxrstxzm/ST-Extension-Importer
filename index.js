@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024 * 1024;
@@ -141,6 +141,148 @@ async function parseZip(arrayBuffer) {
     }
 
     return { entries: result, readEntry };
+}
+
+
+function crc32(bytes) {
+    // Small, self-contained CRC-32 implementation for rebuilding a normalized
+    // archive in the WebView. We intentionally use ZIP "store" entries so the
+    // generated archive does not depend on CompressionStream/Deflate support.
+    if (!crc32.table) {
+        const table = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+            let c = n;
+            for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            table[n] = c >>> 0;
+        }
+        crc32.table = table;
+    }
+    let c = 0xFFFFFFFF;
+    for (const byte of bytes) c = crc32.table[(c ^ byte) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function writeU16(out, offset, value) {
+    out.setUint16(offset, value & 0xFFFF, true);
+}
+
+function writeU32(out, offset, value) {
+    out.setUint32(offset, value >>> 0, true);
+}
+
+function encodeZipName(name) {
+    return new TextEncoder().encode(String(name).replace(/\\/g, '/'));
+}
+
+function makeStoredZip(entries) {
+    // ZIP32 is sufficient for extension packages in this importer. Keep the
+    // archive small by storing already-decoded extension files without a
+    // second compression pass; TauriTavern's native importer will read it.
+    const prepared = entries.filter(entry => entry?.name && entry?.bytes instanceof Uint8Array);
+    let localSize = 0;
+    let centralSize = 0;
+    const records = [];
+
+    for (const entry of prepared) {
+        const nameBytes = encodeZipName(entry.name);
+        if (nameBytes.length > 0xFFFF) throw new Error(`ZIP 文件名过长：${entry.name}`);
+        if (entry.bytes.byteLength > 0xFFFFFFFF) throw new Error(`扩展文件超过 ZIP32 单文件限制：${entry.name}`);
+        const crc = crc32(entry.bytes);
+        const localOffset = localSize;
+        const localLength = 30 + nameBytes.length + entry.bytes.byteLength;
+        const centralLength = 46 + nameBytes.length;
+        if (localOffset > 0xFFFFFFFF || localLength > 0xFFFFFFFF) {
+            throw new Error('生成的归档超过 ZIP32 限制。');
+        }
+        records.push({ ...entry, nameBytes, crc, localOffset });
+        localSize += localLength;
+        centralSize += centralLength;
+    }
+
+    const totalSize = localSize + centralSize + 22;
+    if (totalSize > 0xFFFFFFFF) throw new Error('生成的归档超过 ZIP32 4 GB 限制，请拆分插件后再导入。');
+
+    const out = new Uint8Array(totalSize);
+    const view = new DataView(out.buffer);
+    let offset = 0;
+
+    for (const entry of records) {
+        writeU32(view, offset, 0x04034B50);
+        writeU16(view, offset + 4, 20);       // version needed
+        writeU16(view, offset + 6, 0x0800);   // UTF-8 names
+        writeU16(view, offset + 8, 0);        // stored
+        writeU16(view, offset + 10, 0);
+        writeU16(view, offset + 12, 0);
+        writeU32(view, offset + 14, entry.crc);
+        writeU32(view, offset + 18, entry.bytes.byteLength);
+        writeU32(view, offset + 22, entry.bytes.byteLength);
+        writeU16(view, offset + 26, entry.nameBytes.length);
+        writeU16(view, offset + 28, 0);
+        out.set(entry.nameBytes, offset + 30);
+        out.set(entry.bytes, offset + 30 + entry.nameBytes.length);
+        offset += 30 + entry.nameBytes.length + entry.bytes.byteLength;
+    }
+
+    const centralOffset = offset;
+    for (const entry of records) {
+        writeU32(view, offset, 0x02014B50);
+        writeU16(view, offset + 4, 20);       // made by
+        writeU16(view, offset + 6, 20);       // version needed
+        writeU16(view, offset + 8, 0x0800);   // UTF-8 names
+        writeU16(view, offset + 10, 0);       // stored
+        writeU16(view, offset + 12, 0);
+        writeU16(view, offset + 14, 0);
+        writeU32(view, offset + 16, entry.crc);
+        writeU32(view, offset + 20, entry.bytes.byteLength);
+        writeU32(view, offset + 24, entry.bytes.byteLength);
+        writeU16(view, offset + 28, entry.nameBytes.length);
+        writeU16(view, offset + 30, 0);
+        writeU16(view, offset + 32, 0);
+        writeU16(view, offset + 34, 0);
+        writeU16(view, offset + 36, 0);
+        writeU32(view, offset + 38, 0);
+        writeU32(view, offset + 42, entry.localOffset);
+        out.set(entry.nameBytes, offset + 46);
+        offset += 46 + entry.nameBytes.length;
+    }
+
+    writeU32(view, offset, 0x06054B50);
+    writeU16(view, offset + 4, 0);
+    writeU16(view, offset + 6, 0);
+    writeU16(view, offset + 8, records.length);
+    writeU16(view, offset + 10, records.length);
+    writeU32(view, offset + 12, centralSize);
+    writeU32(view, offset + 16, centralOffset);
+    writeU16(view, offset + 20, 0);
+
+    return new Blob([out], { type: 'application/zip' });
+}
+
+async function buildNativeExtensionArchive(items) {
+    const archiveEntries = [];
+    const seen = new Set();
+
+    for (const item of items) {
+        const root = targetRelativeRoot(item);
+        for (const entry of item.fileList || []) {
+            if (entry.directory) continue;
+            const rel = safeZipRelativePath(item, entry);
+            if (!rel || !isRuntimeImportableRelativePath(rel)) continue;
+
+            const name = `extensions/third-party/${root}/${rel}`;
+            if (seen.has(name)) continue;
+            seen.add(name);
+
+            const bytes = await item.zip.readEntry(entry);
+            archiveEntries.push({ name, bytes });
+        }
+    }
+
+    if (!archiveEntries.length) {
+        throw new Error('选中的扩展没有可导入的运行时文件。');
+    }
+
+    return makeStoredZip(archiveEntries);
 }
 
 function isValidExtensionManifest(meta) {
@@ -1436,31 +1578,6 @@ async function cleanupFailedNewExtensionDirs(items, dataRoot) {
     return { removed, errors };
 }
 
-function nativeArchiveLayoutLooksUsable(scanResult) {
-    // TauriTavern's native data-archive importer requires a recognizable
-    // data-root marker. For extension-only migration the safe form is:
-    // extensions/third-party/<extension>/... (optionally data/...).
-    const names = scanResult?.zip?.entries?.map(e => String(e.name || '').replace(/\\/g, '/').replace(/^\/+/, '')) || [];
-    return names.some(name =>
-        name === 'extensions/third-party' ||
-        name.startsWith('extensions/third-party/') ||
-        name === 'data/extensions/third-party' ||
-        name.startsWith('data/extensions/third-party/')
-    );
-}
-
-function nativeArchiveContainsOnlyThirdParty(scanResult) {
-    const names = scanResult?.zip?.entries?.map(e => String(e.name || '').replace(/\\/g, '/').replace(/^\/+/, '')) || [];
-    const files = names.filter(name => name && !name.endsWith('/'));
-    if (!files.length) return false;
-
-    // Do not let the native overlay accidentally restore ST system extensions
-    // or unrelated files. The archive must be an extension-only data-root.
-    return files.every(name =>
-        name.startsWith('extensions/third-party/') ||
-        name.startsWith('data/extensions/third-party/')
-    );
-}
 
 async function importSelected() {
     const selected = selectedEntries();
@@ -1470,31 +1587,27 @@ async function importSelected() {
     }
 
     const file = selectedFiles[0];
-    const scanResult = selectedZips[0];
-    if (!scanResult || !nativeArchiveLayoutLooksUsable(scanResult)) {
-        return setStatus('这个 ZIP 不能直接交给 TauriTavern 原生归档导入。ZIP 内部必须包含 extensions/third-party/<插件名>/...（可外包一层 data/）。');
-    }
-    if (!nativeArchiveContainsOnlyThirdParty(scanResult)) {
-        return setStatus('为避免覆盖 TT 内置扩展，这个 ZIP 必须只包含 extensions/third-party/ 下的第三方扩展文件，不能把整个 ST extensions 目录直接交给原生导入。');
-    }
-
-    // The native archive importer applies the whole archive atomically at the
-    // TT data-root layer; it cannot receive our checkbox subset. To avoid lying
-    // about selective import, require all discovered third-party entries to be
-    // selected for the native path.
-    if (selected.length !== entries.filter(isImportable).length) {
-        return setStatus('原生归档导入会整体合并 ZIP。当前 ZIP 需要全选第三方扩展；如需只导入其中几个，请先单独打包这些扩展。');
-    }
 
     try {
+        // The native TT importer only understands data-root archive layouts.
+        // ST/GitHub ZIPs commonly have a repository root or the extension files
+        // directly at ZIP root, so normalize the selected extension(s) into
+        // extensions/third-party/<plugin>/... before handing the archive to TT.
+        // This also makes the checkbox selection genuinely selective.
+        const nativeArchive = await buildNativeExtensionArchive(selected);
+        const nativeFile = new File(
+            [nativeArchive],
+            `ST-Extension-Import-${Date.now()}.zip`,
+            { type: 'application/zip' },
+        );
         const install = await getInstallContext();
         const dataRoot = install.baseDir;
         const before = new Map(entries.map(item => [extensionFolderKey(item), Boolean(item.existing)]));
 
-        setStatus(`正在交给 TauriTavern 原生归档系统处理：${file.name}…`);
+        setStatus(`正在整理 ZIP 并交给 TauriTavern 原生归档系统处理：${file.name}…`);
         $('#stei_import').prop('disabled', true);
 
-        const jobId = await requestNativeArchiveImport(file);
+        const jobId = await requestNativeArchiveImport(nativeFile);
         const status = await waitNativeArchiveImport(jobId, status => {
             const percent = Number(status?.progress_percent);
             const message = String(status?.message || status?.stage || '正在导入…');
