@@ -2,7 +2,7 @@
 
 用于在 TauriTavern 中迁移 SillyTavern 的第三方扩展。
 
-## v0.8.2
+## v0.8.3
 
 本版本增加 **TT 兼容化预处理**：
 

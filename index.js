@@ -696,33 +696,68 @@ function getThirdPartyRootFromExtensionPath(path) {
     return '';
 }
 
+async function isInstalledExtensionDirectory(rootPath) {
+    try {
+        const raw = await readFsFile(`${rootPath}/manifest.json`);
+        const meta = JSON.parse(new TextDecoder().decode(raw));
+        if (!isValidExtensionManifest(meta)) return false;
+        const resources = [];
+        for (const key of ['js', 'css']) {
+            const value = meta[key];
+            const values = Array.isArray(value) ? value : [value];
+            for (const rawPath of values) {
+                if (typeof rawPath !== 'string') continue;
+                const rel = normalizeManifestFilePath(rawPath);
+                if (!rel || /^https?:\/\//i.test(rel) || rel.startsWith('//')) continue;
+                resources.push(rel);
+            }
+        }
+        if (!resources.length) return false;
+        for (const rel of resources) {
+            if (!(await fileExistsByReadDir(`${rootPath}/${rel}`))) return false;
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 async function collectInstalledExtensionNames(list, thirdPartyRoot) {
     const installed = new Set();
-
-    // The filesystem is the source of truth. get_extensions() may still contain
-    // a stale/in-memory entry after a failed first install, which used to make
-    // a failed import appear as "已安装" on the next scan.
     try {
         const children = await readFsDir(thirdPartyRoot);
         for (const child of children) {
             const name = basenamePath(child?.name || child?.path || '').trim();
             const isDir = Boolean(child?.isDirectory ?? child?.is_dir ?? child?.is_directory ?? child?.directory ?? child?.children);
-            if (isDir && name && name !== '.' && name !== '..' && !name.startsWith('.')) {
+            if (!isDir || !name || name === '.' || name === '..' || name.startsWith('.')) continue;
+            const root = `${thirdPartyRoot}/${name}`;
+            if (await isInstalledExtensionDirectory(root)) {
                 installed.add(name.toLowerCase());
+            } else {
+                // Clean only a clearly broken extension tree: keep ordinary
+                // folders untouched, but remove a manifest-based package whose
+                // required runtime files are missing. This repairs leftovers
+                // from earlier failed imports instead of labeling them installed.
+                try {
+                    const raw = await readFsFile(`${root}/manifest.json`);
+                    const meta = JSON.parse(new TextDecoder().decode(raw));
+                    if (isValidExtensionManifest(meta)) await remove(root, { verify: true });
+                } catch { /* not a recognizable broken extension package */ }
             }
         }
         return installed;
     } catch {
         // Fallback for TT builds where read_dir is temporarily unavailable.
     }
-
     for (const item of list) {
         for (const value of [item?.name, item?.path, item?.folder, item?.directory]) {
             const p = normalizeFsPath(value);
             if (!p) continue;
             const parts = p.split('/').filter(Boolean);
             const tp = parts.map(x => x.toLowerCase()).lastIndexOf('third-party');
-            if (tp >= 0 && parts[tp + 1]) installed.add(parts[tp + 1].toLowerCase());
+            if (tp < 0 || !parts[tp + 1]) continue;
+            const root = '/' + parts.slice(0, tp + 2).join('/');
+            if (await isInstalledExtensionDirectory(root)) installed.add(parts[tp + 1].toLowerCase());
         }
     }
     return installed;
@@ -994,11 +1029,17 @@ async function verifyManifestResourcesInstalled(item, targetRoot) {
 }
 
 async function importItem(item, zip, dataRoot, overwrite) {
-    const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
+    const targetRoot = `${dataRoot.replace(/[\/]$/, '')}/${targetRelativeRoot(item)}`;
+    const installedBefore = Boolean(item.existing);
     const existedBefore = await existsDir(targetRoot);
     if (overwrite) await remove(targetRoot, { verify: true });
     const createdDirs = new Set();
+    const previousMeta = item.meta;
     try {
+        const prepared = await prepareManifestForTT(item, zip);
+        if (item.ttManifestMissing?.length) throw new Error(`manifest 引用了不存在的文件：${item.ttManifestMissing.join('、')}`);
+        if (item.ttRequiresNewerST) item.ttWarning = '该扩展声明需要高于 TauriTavern 当前 SillyTavern 1.18.0 兼容基线的版本；未强行降低版本要求。';
+        if (item.ttManifest) item.meta = item.ttManifest;
         await validateManifestResources(item);
         await mkdirOnce(targetRoot, createdDirs);
         for (const entry of item.fileList) {
@@ -1006,23 +1047,24 @@ async function importItem(item, zip, dataRoot, overwrite) {
             const rel = safeZipRelativePath(item, entry);
             if (!rel || !isRuntimeImportableRelativePath(rel)) continue;
             const target = `${targetRoot}/${rel}`;
-            const parentParts = target.split('/');
-            parentParts.pop();
+            const parentParts = target.split('/'); parentParts.pop();
             await ensureDirectoryPath(parentParts.join('/'), createdDirs);
             await ensureFileTargetAvailable(target);
-            const bytes = await zip.readEntry(entry);
+            let bytes = await zip.readEntry(entry);
+            if (prepared?.manifestEntry && entry === prepared.manifestEntry && item.ttManifest) {
+                bytes = new TextEncoder().encode(`${JSON.stringify(item.ttManifest, null, 2)}
+`);
+            }
             await writeFile(target, bytes);
         }
         await verifyManifestResourcesInstalled(item, targetRoot);
     } catch (error) {
-        // Never leave a half-created tree behind. In automatic-overwrite mode
-        // the old tree has already been removed, so a failed replacement must
-        // also be cleaned; otherwise the next retry can hit stale files/dirs and
-        // produce ENOTDIR again.
-        if (overwrite || !existedBefore) {
+        if (!installedBefore || overwrite) {
             try { await remove(targetRoot, { verify: true }); } catch {}
         }
         throw error;
+    } finally {
+        item.meta = previousMeta;
     }
 }
 
@@ -1031,8 +1073,29 @@ async function importFolderItem(item, dataRoot, overwrite) {
     const existedBefore = await existsDir(targetRoot);
     if (overwrite) await remove(targetRoot, { verify: true });
     const createdDirs = new Set();
+    const previousMeta = item.meta;
 
     try {
+        // Folder imports get the same TT manifest normalization as ZIP imports.
+        if (item.meta && item.hasManifest) {
+            const manifestEntry = item.fileList.find(e => !e.directory && String(e.name || '').toLowerCase() === 'manifest.json');
+            if (manifestEntry) {
+                const raw = await readFsFile(manifestEntry.path);
+                const meta = JSON.parse(new TextDecoder().decode(raw));
+                const patched = cloneManifestValue(meta);
+                const missing = [];
+                for (const key of ['js', 'css']) {
+                    if (Object.prototype.hasOwnProperty.call(patched, key)) patched[key] = rewriteManifestResourceValue(patched[key], item, missing);
+                }
+                if (patched.i18n && typeof patched.i18n === 'object' && !Array.isArray(patched.i18n)) {
+                    for (const [locale, resource] of Object.entries(patched.i18n)) patched.i18n[locale] = rewriteManifestResourceValue(resource, item, missing);
+                }
+                item.ttManifestMissing = [...new Set(missing)];
+                if (item.ttManifestMissing.length) throw new Error(`manifest 引用了不存在的文件：${item.ttManifestMissing.join('、')}`);
+                item.ttManifest = patched;
+                item.meta = patched;
+            }
+        }
         await validateManifestResources(item);
         await mkdirOnce(targetRoot, createdDirs);
 
@@ -1062,7 +1125,10 @@ async function importFolderItem(item, dataRoot, overwrite) {
         await ensureDirectoryPath(parentParts.join('/'), createdDirs);
         await ensureFileTargetAvailable(target);
 
-        const bytes = await readFsFile(entry.path);
+        let bytes = await readFsFile(entry.path);
+        if (String(entry.name || '').toLowerCase() === 'manifest.json' && item.ttManifest) {
+            bytes = new TextEncoder().encode(`${JSON.stringify(item.ttManifest, null, 2)}\n`);
+        }
         await writeFile(target, bytes);
         }
         await verifyManifestResourcesInstalled(item, targetRoot);
@@ -1715,100 +1781,57 @@ async function cleanupFailedNewExtensionDirs(items, dataRoot) {
 async function importSelected() {
     const selected = selectedEntries();
     if (!selected.length) return setStatus('没有选择要导入的扩展。');
-    if (selectedFiles.length !== 1) {
-        return setStatus('v0.8.0 的原生归档导入要求一次选择一个 ZIP。先选择一个 ZIP 再导入。');
-    }
-
-    const file = selectedFiles[0];
-
     try {
-        // The native TT importer only understands data-root archive layouts.
-        // ST/GitHub ZIPs commonly have a repository root or the extension files
-        // directly at ZIP root, so normalize the selected extension(s) into
-        // extensions/third-party/<plugin>/... before handing the archive to TT.
-        // This also makes the checkbox selection genuinely selective.
-        const nativeArchive = await buildNativeExtensionArchive(selected);
-        const nativeFile = new File(
-            [nativeArchive],
-            `ST-Extension-Import-${Date.now()}.zip`,
-            { type: 'application/zip' },
-        );
         const install = await getInstallContext();
         const dataRoot = install.baseDir;
-        const before = new Map(selected.map(item => [extensionFolderKey(item), Boolean(item.existing)]));
-
-        setStatus(`正在整理 ZIP 并交给 TauriTavern 原生归档系统处理：${file.name}…`);
-        $('#stei_import').prop('disabled', true);
-
-        const jobId = await requestNativeArchiveImport(nativeFile);
-        const status = await waitNativeArchiveImport(jobId, status => {
-            const percent = Number(status?.progress_percent);
-            const message = String(status?.message || status?.stage || '正在导入…');
-            setStatus(Number.isFinite(percent) ? `原生导入：${Math.round(percent)}% · ${message}` : `原生导入：${message}`);
-        });
-
-        const failed = String(status?.state || '').toLowerCase() !== 'completed';
-
         const results = [];
-        for (const item of selected) {
-            const key = extensionFolderKey(item);
+        $('#stei_import').prop('disabled', true);
+        setStatus(`开始逐个导入 ${selected.length} 个扩展…`);
+
+        // Android's /api/extensions/data-migration/import is intentionally a
+        // native data-archive flow. Do not POST a generated extension ZIP there:
+        // Android rejects WebView-uploaded archives with "must use the native
+        // archive picker". An extension package is instead copied directly into
+        // TT's third-party filesystem layout, with manifest resources normalized.
+        for (let i = 0; i < selected.length; i++) {
+            const item = selected[i];
             const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
-            const existedBefore = before.get(key) === true;
-            const existsAfter = await existsDir(targetRoot);
-            let resourcesOk = existsAfter;
-            let resourceError = '';
-            if (existsAfter) {
-                try {
-                    if (item.ttManifestMissing?.length) {
-                        resourcesOk = false;
-                        resourceError = `manifest 引用缺失：${item.ttManifestMissing.join('、')}`;
-                    } else if (item.ttManifest) {
-                        const previousMeta = item.meta;
-                        item.meta = item.ttManifest;
-                        try {
-                            await verifyManifestResourcesInstalled(item, targetRoot);
-                        } finally {
-                            item.meta = previousMeta;
-                        }
-                    }
-                } catch (error) {
-                    resourcesOk = false;
-                    resourceError = error?.message || String(error);
+            const existedBefore = Boolean(item.existing);
+            setStatus(`正在导入 ${i + 1}/${selected.length}：${item.displayName}…`);
+            try {
+                if (item.sourceFolder) await importFolderItem(item, dataRoot, false);
+                else await importItem(item, item.zip || selectedZipForItem(item), dataRoot, false);
+                const validAfter = await existsDir(targetRoot) && await isInstalledExtensionDirectory(targetRoot);
+                if (!validAfter) throw new Error('导入完成但未通过安装后验证：manifest 或 JS/CSS 资源不完整');
+                item.existing = true;
+                results.push({ item, ok: true, existedBefore, error: '' });
+            } catch (error) {
+                const message = error?.message || String(error);
+                const validAfter = await existsDir(targetRoot) && await isInstalledExtensionDirectory(targetRoot);
+                if (!validAfter && !existedBefore) {
+                    try { await remove(targetRoot, { verify: true }); } catch {}
+                    item.existing = false;
+                } else {
+                    item.existing = validAfter;
                 }
+                results.push({ item, ok: false, existedBefore, error: message });
             }
-
-            const ok = resourcesOk;
-            if (!ok && existsAfter && !existedBefore) {
-                try {
-                    await remove(targetRoot, { verify: true });
-                } catch (error) {
-                    resourceError = resourceError || `清理失败：${error?.message || String(error)}`;
-                }
-            }
-            const existsFinal = await existsDir(targetRoot);
-            item.existing = existsFinal;
-            results.push({ item, ok, existsAfter: existsFinal, existedBefore, resourceError });
         }
-
         const okCount = results.filter(x => x.ok).length;
         const failCount = results.length - okCount;
-        const errorText = String(status?.error || status?.message || '原生归档导入失败');
         const lines = results.map(x => {
             if (x.ok) return `✓ ${x.item.displayName}：已安装`;
-            if (x.existsAfter && x.existedBefore) return `⚠ ${x.item.displayName}：导入失败，保留原有安装${x.resourceError ? `（${x.resourceError}）` : ''}`;
-            return `✕ ${x.item.displayName}：未安装${x.resourceError ? `（${x.resourceError}）` : ''}`;
+            if (x.item.existing && x.existedBefore) return `⚠ ${x.item.displayName}：导入失败，保留原有安装（${x.error}）`;
+            return `✕ ${x.item.displayName}：未安装（${x.error}）`;
         });
-        if (failed) lines.unshift(`原生导入任务失败：${errorText}；已按每个扩展实际文件逐个重新校验。`);
-
         $('#stei_result').html(`<div class="stei-result-title">导入结果</div><div class="stei-result-lines">${lines.map(escapeHtml).join('<br>')}</div>`).show();
         renderList(entries);
-
-        if (!failed && failCount === 0) {
-            setStatus(`导入完成：${okCount} 个扩展已逐个验证可加载资源。建议重新加载 TT。`);
+        if (failCount === 0) {
+            setStatus(`导入完成：${okCount} 个扩展逐个验证通过。建议重新加载 TT。`);
             window.toastr?.success?.(`ST 扩展导入完成：${okCount} 个`, 'ST Extension Importer');
         } else {
-            setStatus(`导入结束：${okCount} 个通过验证，${failCount} 个未安装/保留旧版本。${failed ? '原生任务曾报告失败，但成功项已单独确认。' : ''}`);
-            if (failCount) window.toastr?.error?.(errorText, 'ST Extension Importer');
+            setStatus(`导入结束：${okCount} 个成功，${failCount} 个未安装/保留旧版本。`);
+            window.toastr?.error?.(`有 ${failCount} 个扩展未通过安装验证，请查看下方逐项结果。`, 'ST Extension Importer');
         }
     } catch (error) {
         setStatus(`导入失败：${error?.message || error}`);
