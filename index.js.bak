@@ -179,41 +179,6 @@ function makeStoredZip(entries) {
     // archive small by storing already-decoded extension files without a
     // second compression pass; TauriTavern's native importer will read it.
     const prepared = entries.filter(entry => entry?.name && entry?.bytes instanceof Uint8Array);
-
-    // The TT data-archive normalizer creates parent directories with
-    // create_dir_all(). A ZIP that contains both `foo` as a file and
-    // `foo/bar.js` as another file makes `foo` a file when the first entry is
-    // normalized, so the later parent-directory creation fails with
-    // `Failed to create normalized parent directory: File exists`. Such a
-    // package is not representable as a normal filesystem tree. Prefer the
-    // longer runtime paths and drop an ancestor file when it is not itself a
-    // required manifest entry; otherwise fail with a useful error before TT
-    // sees the archive.
-    const names = prepared.map(e => String(e.name).replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''));
-    const nameSet = new Set(names);
-    const ancestorConflicts = [];
-    for (const name of names) {
-        const parts = name.split('/');
-        for (let i = 1; i < parts.length; i++) {
-            const ancestor = parts.slice(0, i).join('/');
-            if (nameSet.has(ancestor)) ancestorConflicts.push({ ancestor, child: name });
-        }
-    }
-    if (ancestorConflicts.length) {
-        const required = new Set();
-        for (const e of prepared) {
-            if (e.requiredByManifest) required.add(String(e.name));
-        }
-        const bad = ancestorConflicts.filter(x => required.has(x.ancestor));
-        if (bad.length) {
-            throw new Error(`扩展归档存在文件/目录路径冲突：${bad[0].ancestor} 同时是文件和目录，TT 无法导入。`);
-        }
-        const drop = new Set(ancestorConflicts.map(x => x.ancestor));
-        for (let i = prepared.length - 1; i >= 0; i--) {
-            if (drop.has(String(prepared[i].name).replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))) prepared.splice(i, 1);
-        }
-    }
-
     let localSize = 0;
     let centralSize = 0;
     const records = [];
@@ -428,13 +393,6 @@ async function buildNativeExtensionArchive(items) {
             item.ttWarning = '该扩展声明需要高于 TauriTavern 当前 SillyTavern 1.18.0 兼容基线的版本；未强行降低版本要求。';
         }
 
-        const requiredResourcePaths = new Set();
-        for (const resource of manifestResourceList({ meta: item.ttManifest || item.meta || {} })) {
-            const resolved = findBestArchivePath(item, resource.path);
-            if (resolved) requiredResourcePaths.add(normalizeResourcePathForMatch(resolved));
-        }
-        if (prepared?.manifestEntry) requiredResourcePaths.add(normalizeResourcePathForMatch(prepared.manifestEntry.name));
-
         for (const entry of item.fileList || []) {
             if (entry.directory) continue;
             const rel = safeZipRelativePath(item, entry);
@@ -448,11 +406,7 @@ async function buildNativeExtensionArchive(items) {
             if (prepared?.manifestEntry && entry === prepared.manifestEntry && item.ttManifest) {
                 bytes = new TextEncoder().encode(`${JSON.stringify(item.ttManifest, null, 2)}\n`);
             }
-            archiveEntries.push({
-                name,
-                bytes,
-                requiredByManifest: requiredResourcePaths.has(normalizeResourcePathForMatch(rel)),
-            });
+            archiveEntries.push({ name, bytes });
         }
     }
 
@@ -1905,8 +1859,9 @@ async function stageArchiveBlobForTT(blob) {
         }
 
         const finished = await invoke('stage_upload_finish', {
-            file_path: filePath,
-            expected_size: blob.size,
+            // Raw Tauri IPC uses the command's camelCase argument names.
+            filePath,
+            expectedSize: blob.size,
         });
         const finishedPath = String(finished?.file_path || filePath).trim();
         if (!finishedPath) throw new Error('TT 没有返回完成后的归档路径');
@@ -1914,12 +1869,12 @@ async function stageArchiveBlobForTT(blob) {
         return {
             filePath,
             cleanup: async () => {
-                try { await invoke('stage_upload_discard', { file_path: filePath }); } catch {}
+                try { await invoke('stage_upload_discard', { filePath }); } catch {}
             },
         };
     } catch (error) {
         if (filePath) {
-            try { await invoke('stage_upload_discard', { file_path: filePath }); } catch {}
+            try { await invoke('stage_upload_discard', { filePath }); } catch {}
         }
         throw error;
     }
