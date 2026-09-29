@@ -1,7 +1,7 @@
 import { renderExtensionTemplateAsync } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'third-party/ST-Extension-Importer';
-const VERSION = '0.8.1';
+const VERSION = '0.8.2';
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024 * 1024;
@@ -258,12 +258,135 @@ function makeStoredZip(entries) {
     return new Blob([out], { type: 'application/zip' });
 }
 
+function cloneManifestValue(value) {
+    if (Array.isArray(value)) return value.map(cloneManifestValue);
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [key, child] of Object.entries(value)) out[key] = cloneManifestValue(child);
+        return out;
+    }
+    return value;
+}
+
+function normalizeResourcePathForMatch(value) {
+    return String(value || '')
+        .replace(/\\/g, '/')
+        .replace(/^\.\//, '')
+        .replace(/^\/+/, '')
+        .split(/[?#]/, 1)[0]
+        .replace(/\/+/g, '/')
+        .trim();
+}
+
+function findBestArchivePath(item, requestedPath) {
+    const wanted = normalizeResourcePathForMatch(requestedPath);
+    if (!wanted) return null;
+    const files = (item.fileList || []).filter(e => !e.directory && e.name);
+    const exact = files.find(e => normalizeResourcePathForMatch(e.name) === wanted);
+    if (exact) return exact.name;
+
+    const lowerWanted = wanted.toLowerCase();
+    const caseInsensitive = files.filter(e => normalizeResourcePathForMatch(e.name).toLowerCase() === lowerWanted);
+    if (caseInsensitive.length === 1) return caseInsensitive[0].name;
+
+    // GitHub repositories often put the real frontend assets under src/ or public/,
+    // while the manifest still uses paths relative to the built extension root.
+    // If the requested path exists as a unique suffix, retarget the manifest to it.
+    const suffix = `/${lowerWanted}`;
+    const suffixMatches = files.filter(e => {
+        const path = normalizeResourcePathForMatch(e.name).toLowerCase();
+        return path.endsWith(suffix);
+    });
+    if (suffixMatches.length === 1) return suffixMatches[0].name;
+
+    // Last-resort compatibility for packages that moved an asset but kept its
+    // basename. Only accept a unique basename to avoid silently choosing the
+    // wrong stylesheet/script.
+    const basename = lowerWanted.split('/').filter(Boolean).at(-1);
+    if (basename) {
+        const basenameMatches = files.filter(e => normalizeResourcePathForMatch(e.name).toLowerCase().split('/').at(-1) === basename);
+        if (basenameMatches.length === 1) return basenameMatches[0].name;
+    }
+    return null;
+}
+
+function rewriteManifestResourceValue(value, item, missing) {
+    if (typeof value === 'string') {
+        const requested = normalizeResourcePathForMatch(value);
+        if (!requested || /^https?:\/\//i.test(requested) || requested.startsWith('//')) return value;
+        const resolved = findBestArchivePath(item, requested);
+        if (resolved) return resolved;
+        missing.push(requested);
+        return value;
+    }
+    if (Array.isArray(value)) return value.map(child => rewriteManifestResourceValue(child, item, missing));
+    return value;
+}
+
+async function prepareManifestForTT(item, zip) {
+    const manifestEntry = (item.fileList || []).find(e => !e.directory && String(e.name || '').toLowerCase() === 'manifest.json');
+    if (!manifestEntry) {
+        item.ttManifest = null;
+        item.ttManifestMissing = [];
+        return null;
+    }
+
+    let meta;
+    try {
+        meta = JSON.parse(new TextDecoder().decode(await zip.readEntry(manifestEntry)));
+    } catch {
+        item.ttManifest = null;
+        item.ttManifestMissing = [];
+        return null;
+    }
+
+    const patched = cloneManifestValue(meta);
+    const missing = [];
+    for (const key of ['js', 'css']) {
+        if (Object.prototype.hasOwnProperty.call(patched, key)) {
+            patched[key] = rewriteManifestResourceValue(patched[key], item, missing);
+        }
+    }
+    if (patched.i18n && typeof patched.i18n === 'object' && !Array.isArray(patched.i18n)) {
+        for (const [locale, resource] of Object.entries(patched.i18n)) {
+            patched.i18n[locale] = rewriteManifestResourceValue(resource, item, missing);
+        }
+    }
+
+    // TauriTavern currently exposes the SillyTavern 1.18.0 compatibility baseline.
+    // Do not lie about extensions requiring newer ST APIs; report those separately
+    // instead of silently lowering the requirement.
+    const minClient = String(patched.minimum_client_version ?? '').trim();
+    item.ttRequiresNewerST = Boolean(minClient && versionGreaterThan(minClient, '1.18.0'));
+    item.ttManifestMissing = [...new Set(missing)];
+    item.ttManifest = patched;
+    return { manifestEntry, original: meta, patched };
+}
+
+function versionGreaterThan(a, b) {
+    const clean = value => String(value || '').replace(/^SillyTavern:/i, '').split(':')[0].trim();
+    const pa = clean(a).split('.').map(x => Number.parseInt(x, 10) || 0);
+    const pb = clean(b).split('.').map(x => Number.parseInt(x, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+    }
+    return false;
+}
+
 async function buildNativeExtensionArchive(items) {
     const archiveEntries = [];
     const seen = new Set();
 
     for (const item of items) {
         const root = targetRelativeRoot(item);
+        const prepared = await prepareManifestForTT(item, item.zip || selectedZipForItem(item));
+        if (item.ttManifestMissing?.length) {
+            throw new Error(`扩展“${item.displayName}”的 manifest 仍引用不存在的文件：${item.ttManifestMissing.join('、')}。已停止导入，避免产生“已安装但加载失败”的假安装。`);
+        }
+        if (item.ttRequiresNewerST) {
+            item.ttWarning = '该扩展声明需要高于 TauriTavern 当前 SillyTavern 1.18.0 兼容基线的版本；未强行降低版本要求。';
+        }
+
         for (const entry of item.fileList || []) {
             if (entry.directory) continue;
             const rel = safeZipRelativePath(item, entry);
@@ -273,7 +396,10 @@ async function buildNativeExtensionArchive(items) {
             if (seen.has(name)) continue;
             seen.add(name);
 
-            const bytes = await item.zip.readEntry(entry);
+            let bytes = await item.zip.readEntry(entry);
+            if (prepared?.manifestEntry && entry === prepared.manifestEntry && item.ttManifest) {
+                bytes = new TextEncoder().encode(`${JSON.stringify(item.ttManifest, null, 2)}\n`);
+            }
             archiveEntries.push({ name, bytes });
         }
     }
@@ -283,6 +409,10 @@ async function buildNativeExtensionArchive(items) {
     }
 
     return makeStoredZip(archiveEntries);
+}
+
+function selectedZipForItem(item) {
+    return item?.zip || selectedZips?.[0]?.zip || null;
 }
 
 function isValidExtensionManifest(meta) {
@@ -382,6 +512,7 @@ async function scanZip(file) {
             return {
                 zip,
                 extensions: [{
+                    zip,
                     root: name,
                     sourceRoot: normalizedRoot,
                     type: 'third-party',
@@ -449,6 +580,7 @@ async function scanZip(file) {
         if (!fileList.some(e => !e.directory) || !hasUsefulFile) continue;
 
         found.push({
+            zip,
             root,
             type: 'third-party',
             displayName: String(meta.display_name || meta.displayName || root),
@@ -480,6 +612,7 @@ async function scanZip(file) {
                 .replace(/^-+|-+$/g, '') || 'extension';
 
             found.push({
+                zip,
                 root: fallbackName,
                 type: 'third-party',
                 displayName: String(meta.display_name || meta.displayName || fallbackName),
@@ -529,7 +662,7 @@ function renderItem(item, index) {
             <span class="stei-badge">${escapeHtml(item.type)}</span>
           </div>
           <div class="stei-item-meta">${item.version ? `${escapeHtml(item.version)} · ` : ''}${escapeHtml(item.root)}</div>
-          ${builtin ? '<div class="stei-item-warning">TT 已有对应内置扩展，默认不导入。</div>' : ''}${item.sourceFolder && !item.hasManifest ? '<div class="stei-item-warning">未发现 manifest.json，但它位于 third-party 的直接子目录中，将按扩展目录迁移。</div>' : ''}${item.empty ? '<div class="stei-item-warning">目录为空，无法导入。</div>' : ''}${item.unreadable ? `<div class="stei-item-warning">无法读取：${escapeHtml(item.scanError || '未知错误')}</div>` : ''}${item.repoPackage && item.hasServerPlugin ? '<div class="stei-item-warning">此仓库同时包含 Server Plugin；当前仅迁移前端扩展文件，后端插件不会被放进 third-party 目录。</div>' : ''}
+          ${builtin ? '<div class="stei-item-warning">TT 已有对应内置扩展，默认不导入。</div>' : ''}${item.sourceFolder && !item.hasManifest ? '<div class="stei-item-warning">未发现 manifest.json，但它位于 third-party 的直接子目录中，将按扩展目录迁移。</div>' : ''}${item.empty ? '<div class="stei-item-warning">目录为空，无法导入。</div>' : ''}${item.unreadable ? `<div class="stei-item-warning">无法读取：${escapeHtml(item.scanError || '未知错误')}</div>` : ''}${item.repoPackage && item.hasServerPlugin ? '<div class="stei-item-warning">此仓库同时包含 Server Plugin；当前仅迁移前端扩展文件，后端插件不会被放进 third-party 目录。</div>' : ''}${item.ttWarning ? `<div class="stei-item-warning">${escapeHtml(item.ttWarning)}</div>` : ''}
         </div>
     </label>`;
 }
@@ -1602,7 +1735,7 @@ async function importSelected() {
         );
         const install = await getInstallContext();
         const dataRoot = install.baseDir;
-        const before = new Map(entries.map(item => [extensionFolderKey(item), Boolean(item.existing)]));
+        const before = new Map(selected.map(item => [extensionFolderKey(item), Boolean(item.existing)]));
 
         setStatus(`正在整理 ZIP 并交给 TauriTavern 原生归档系统处理：${file.name}…`);
         $('#stei_import').prop('disabled', true);
@@ -1615,25 +1748,46 @@ async function importSelected() {
         });
 
         const failed = String(status?.state || '').toLowerCase() !== 'completed';
-        let cleanup = { removed: [], errors: [] };
-
-        if (failed) {
-            // Native import can report local_applied=true if it failed after some
-            // files were written. Clean only extension directories that were NOT
-            // present before this job, so an existing installation is never
-            // destroyed merely because a new archive failed.
-            cleanup = await cleanupFailedNewExtensionDirs(entries, dataRoot);
-        }
 
         const results = [];
-        for (const item of entries) {
+        for (const item of selected) {
             const key = extensionFolderKey(item);
             const targetRoot = `${dataRoot.replace(/[\\/]$/, '')}/${targetRelativeRoot(item)}`;
-            const existsAfter = await existsDir(targetRoot);
             const existedBefore = before.get(key) === true;
-            const ok = !failed && existsAfter;
-            item.existing = existsAfter;
-            results.push({ item, ok, existsAfter, existedBefore });
+            const existsAfter = await existsDir(targetRoot);
+            let resourcesOk = existsAfter;
+            let resourceError = '';
+            if (existsAfter) {
+                try {
+                    if (item.ttManifestMissing?.length) {
+                        resourcesOk = false;
+                        resourceError = `manifest 引用缺失：${item.ttManifestMissing.join('、')}`;
+                    } else if (item.ttManifest) {
+                        const previousMeta = item.meta;
+                        item.meta = item.ttManifest;
+                        try {
+                            await verifyManifestResourcesInstalled(item, targetRoot);
+                        } finally {
+                            item.meta = previousMeta;
+                        }
+                    }
+                } catch (error) {
+                    resourcesOk = false;
+                    resourceError = error?.message || String(error);
+                }
+            }
+
+            const ok = resourcesOk;
+            if (!ok && existsAfter && !existedBefore) {
+                try {
+                    await remove(targetRoot, { verify: true });
+                } catch (error) {
+                    resourceError = resourceError || `清理失败：${error?.message || String(error)}`;
+                }
+            }
+            const existsFinal = await existsDir(targetRoot);
+            item.existing = existsFinal;
+            results.push({ item, ok, existsAfter: existsFinal, existedBefore, resourceError });
         }
 
         const okCount = results.filter(x => x.ok).length;
@@ -1641,22 +1795,20 @@ async function importSelected() {
         const errorText = String(status?.error || status?.message || '原生归档导入失败');
         const lines = results.map(x => {
             if (x.ok) return `✓ ${x.item.displayName}：已安装`;
-            if (x.existsAfter && x.existedBefore) return `⚠ ${x.item.displayName}：导入任务失败，保留原有安装`;
-            return `✕ ${x.item.displayName}：未安装`;
+            if (x.existsAfter && x.existedBefore) return `⚠ ${x.item.displayName}：导入失败，保留原有安装${x.resourceError ? `（${x.resourceError}）` : ''}`;
+            return `✕ ${x.item.displayName}：未安装${x.resourceError ? `（${x.resourceError}）` : ''}`;
         });
-        if (cleanup.removed.length) lines.push(`已自动删除失败导入残留：${cleanup.removed.join('、')}`);
-        if (cleanup.errors.length) lines.push(`清理失败：${cleanup.errors.join('；')}`);
-        if (failed) lines.unshift(`原生导入失败：${errorText}`);
+        if (failed) lines.unshift(`原生导入任务失败：${errorText}；已按每个扩展实际文件逐个重新校验。`);
 
         $('#stei_result').html(`<div class="stei-result-title">导入结果</div><div class="stei-result-lines">${lines.map(escapeHtml).join('<br>')}</div>`).show();
         renderList(entries);
 
-        if (!failed) {
-            setStatus(`导入完成：${okCount} 个扩展已确认存在。建议重新加载 TT。`);
-            window.toastr?.success?.(`ST 扩展原生导入完成：${okCount} 个`, 'ST Extension Importer');
+        if (!failed && failCount === 0) {
+            setStatus(`导入完成：${okCount} 个扩展已逐个验证可加载资源。建议重新加载 TT。`);
+            window.toastr?.success?.(`ST 扩展导入完成：${okCount} 个`, 'ST Extension Importer');
         } else {
-            setStatus(`导入失败：${okCount} 个确认成功，${failCount} 个未安装；失败的新目录已自动清理。`);
-            window.toastr?.error?.(errorText, 'ST Extension Importer');
+            setStatus(`导入结束：${okCount} 个通过验证，${failCount} 个未安装/保留旧版本。${failed ? '原生任务曾报告失败，但成功项已单独确认。' : ''}`);
+            if (failCount) window.toastr?.error?.(errorText, 'ST Extension Importer');
         }
     } catch (error) {
         setStatus(`导入失败：${error?.message || error}`);

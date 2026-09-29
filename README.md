@@ -2,6 +2,17 @@
 
 用于在 TauriTavern 中迁移 SillyTavern 的第三方扩展。
 
+## v0.8.2
+
+本版本增加 **TT 兼容化预处理**：
+
+- 导入前读取 manifest.json，自动检查 `js` / `css` / `i18n` 实际文件。
+- 如果扩展把资源放在 `src/`、`public/` 等目录，而 manifest 仍引用旧路径，会在导入 ZIP 时自动把 manifest 路径改到唯一匹配的真实文件。
+- 支持大小写路径差异和唯一 basename/suffix 匹配，避免导入后出现 `stylesheet load failed`。
+- 导入任务即使整体返回失败，也会逐个检查每个扩展的实际目录和 manifest 资源；成功的单独显示“已安装”，失败的新目录自动删除。
+- 已存在的旧安装不会因为本次失败被删除。
+- 对声明需要高于 TT 当前 SillyTavern 1.18.0 兼容基线的扩展，只提示“不保证兼容”，不会偷偷降低最低版本要求。真正依赖更新 ST API 的扩展仍需要针对代码本身适配。
+
 ## v0.8.1
 
 本版本会先在前端把选中的 SillyTavern / GitHub ZIP 规范化为 TauriTavern 原生归档格式，再交给 TT 后端导入。
